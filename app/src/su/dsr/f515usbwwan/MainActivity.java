@@ -1,0 +1,463 @@
+package su.dsr.f515usbwwan;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.graphics.Color;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.View;
+import android.widget.Button;
+import android.widget.HorizontalScrollView;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Всю работу делают скрипты на голове (wwan-up.sh - стадиями, с проверкой предусловий;
+ * wwan-boot.sh - автозапуск и watchdog) - этот экран только раскладывает их и запускает
+ * с разными аргументами. Само по себе ничего не стартует: либо кнопка, либо явно
+ * включённый автозапуск.
+ */
+public class MainActivity extends Activity {
+
+    private static final String SPEEDTEST_URL = "https://internet.yandex.ru";
+
+    private TextView log;
+    private LinearLayout buttonsRow;
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private boolean busy = false;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(24, 24, 24, 24);
+        root.setBackgroundColor(Color.BLACK);
+
+        TextView version = new TextView(this);
+        version.setText("F515 USB WWAN " + versionName());
+        version.setTextColor(Color.GRAY);
+        version.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        root.addView(version);
+
+        buttonsRow = new LinearLayout(this);
+        buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
+        addRunButton("Проверка", "--check");
+        addRunButton("Включить", "--system");
+        addRunButton("Выключить", "--down");
+        addAutostartButton();
+        addUrlButton("Интернетометр", SPEEDTEST_URL);
+        addFormatButton();
+        HorizontalScrollView buttonsScroll = new HorizontalScrollView(this);
+        buttonsScroll.addView(buttonsRow);
+        root.addView(buttonsScroll);
+
+        log = new TextView(this);
+        log.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        log.setTextColor(Color.WHITE);
+        log.setTextIsSelectable(true);
+        log.setGravity(Gravity.TOP);
+        ScrollView sv = new ScrollView(this);
+        sv.addView(log);
+        root.addView(sv);
+
+        setContentView(root);
+
+        append("ready. adbd target " + Keeper.ADB_HOST + ":" + Keeper.ADB_PORT);
+        append("тип модема определяется сам: HiLink (CDC-Ethernet) или AT/PPP (Huawei).");
+        append("");
+        append("Проверка      - только диагностика, ничего не меняет");
+        append("Включить      - поднять модем и раздать интернет приложениям Android");
+        append("Выключить     - остановить pppd");
+        append("Автозапуск    - подъём после перезагрузки головы + слежение за связью");
+        append("Интернетометр - открыть " + SPEEDTEST_URL + " (проверка интернета глазами)");
+        append("Форматировать SD - выбрать и стереть SD/TF-карту (необратимо)");
+        append("");
+        append("автозапуск сейчас: " + (Autostart.isEnabled(this) ? "ВКЛЮЧЕН" : "выключен"));
+    }
+
+    // ------------------------------------------------------------------ кнопки --
+
+    private void addRunButton(String text, final String args) {
+        buttonsRow.addView(button(text, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                runInBackground("> " + text + " ...", new Job() {
+                    @Override
+                    public void run(Keeper.Progress p) {
+                        Keeper.run(MainActivity.this, args, p);
+                    }
+                });
+            }
+        }));
+    }
+
+    /**
+     * Автозапуск - единственное, что после нажатия продолжает жить само по себе, поэтому
+     * он не «кнопка-переключатель», а диалог: сначала показываем реальное состояние с
+     * головы (включая безопасный режим, если wwan-boot.sh его включил), и только потом
+     * человек решает.
+     */
+    private void addAutostartButton() {
+        buttonsRow.addView(button("Автозапуск", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (busy) return;
+                setBusy(true);
+                append("");
+                append("> Автозапуск: читаю состояние...");
+                background(new Runnable() {
+                    @Override
+                    public void run() {
+                        final String out = Keeper.runBoot(MainActivity.this, "--status", null);
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                setBusy(false);
+                                showAutostartDialog(out);
+                            }
+                        });
+                    }
+                });
+            }
+        }));
+    }
+
+    private void showAutostartDialog(String status) {
+        final boolean enabled = Autostart.isEnabled(this);
+        final boolean blocked = value(status, "disabled").equals("1");
+        String reason = value(status, "disabled_reason");
+        String attempts = value(status, "attempts");
+        String maxAttempts = value(status, "max_attempts");
+        String lastOk = value(status, "last_ok");
+        String iface = value(status, "wan_iface");
+        String addr = value(status, "wan_addr");
+        boolean watchdog = status.contains("watchdog=1");
+
+        StringBuilder msg = new StringBuilder();
+        msg.append("Автозапуск приложения: ").append(enabled ? "включен" : "выключен").append('\n');
+        msg.append("Watchdog на голове: ").append(watchdog ? "работает" : "не запущен").append('\n');
+        if (!iface.isEmpty()) {
+            msg.append("Интерфейс: ").append(iface).append(' ')
+                    .append(addr.isEmpty() ? "(без адреса)" : addr).append('\n');
+        }
+        if (!lastOk.isEmpty()) msg.append("Последний удачный подъём: ").append(lastOk).append('\n');
+        msg.append("Незавершённых заходов: ").append(attempts).append(" из ").append(maxAttempts).append('\n');
+        if (blocked) {
+            msg.append("\nБЕЗОПАСНЫЙ РЕЖИМ: автозапуск заблокирован на голове.\n")
+                    .append(reason).append('\n')
+                    .append("\nПока блокировка стоит, после перезагрузки ничего не поднимается — ")
+                    .append("это защита от цикла перезагрузок. Снимать её стоит, только если понятно, ")
+                    .append("из-за чего голова падала.");
+        }
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+                .setTitle("Автозапуск после перезагрузки")
+                .setMessage(msg.toString());
+
+        if (enabled) {
+            b.setNegativeButton("Выключить", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int which) {
+                    Autostart.setEnabled(MainActivity.this, false);
+                    append("автозапуск выключен (после перезагрузки ничего не поднимется)");
+                    stopWatchdog();
+                }
+            });
+        } else {
+            b.setPositiveButton("Включить", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int which) {
+                    Autostart.setEnabled(MainActivity.this, true);
+                    append("автозапуск включен: после перезагрузки модем поднимется сам");
+                    append("(защита от бутлупа — см. docs/autostart.md)");
+                }
+            });
+        }
+        if (blocked) {
+            b.setNeutralButton("Снять блокировку", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int which) {
+                    runInBackground("> снимаю блокировку автозапуска...", new Job() {
+                        @Override
+                        public void run(Keeper.Progress p) {
+                            Keeper.runBoot(MainActivity.this, "--reset", p);
+                        }
+                    });
+                }
+            });
+        } else {
+            b.setNeutralButton("Запустить сейчас", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int which) {
+                    runInBackground("> запускаю wwan-boot.sh (подъём + watchdog)...", new Job() {
+                        @Override
+                        public void run(Keeper.Progress p) {
+                            Keeper.startAutostart(MainActivity.this, true, p);
+                        }
+                    });
+                }
+            });
+        }
+        b.show();
+    }
+
+    private void stopWatchdog() {
+        runInBackground("> останавливаю watchdog...", new Job() {
+            @Override
+            public void run(Keeper.Progress p) {
+                Keeper.runBoot(MainActivity.this, "--stop", p);
+            }
+        });
+    }
+
+    /** "key=value" из вывода wwan-boot.sh --status. */
+    private String value(String text, String key) {
+        for (String l : text.split("\n")) {
+            String s = l.trim();
+            if (s.startsWith(key + "=")) return s.substring(key.length() + 1).trim();
+        }
+        return "";
+    }
+
+    /**
+     * Форматирование - деструктивная операция, поэтому в отличие от остальных кнопок
+     * ничего не запускает сразу: сначала опрашивает format-sdcard.sh --list (безопасно,
+     * ничего не меняет), затем пользователь явно выбирает устройство и подтверждает.
+     * Никакого автовыбора "самой вероятной" карты - список показывает vendor/model/размер,
+     * решает человек.
+     */
+    private void addFormatButton() {
+        buttonsRow.addView(button("Форматировать SD", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (busy) return;
+                setBusy(true);
+                append("");
+                append("> Форматировать SD: ищу карты...");
+                background(new Runnable() {
+                    @Override
+                    public void run() {
+                        final String out = Keeper.runFormat(MainActivity.this, "--list", null);
+                        final List<String[]> devices = parseDevices(out);
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (devices.isEmpty()) {
+                                    append("устройства не найдены (или ошибка):");
+                                    append(out);
+                                    setBusy(false);
+                                } else {
+                                    showDeviceChooser(devices);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        }));
+    }
+
+    /** Строки вида "sdb|HUAWEI|TF CARD Storage|14.5G|exfat|" из format-sdcard.sh --list. */
+    private List<String[]> parseDevices(String out) {
+        List<String[]> result = new ArrayList<>();
+        for (String line : out.split("\n")) {
+            String[] p = line.split("\\|", -1);
+            if (p.length >= 6 && p[0].matches("sd[a-z]")) {
+                result.add(p);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Один диалог: радио-список карт + кнопка "Форматировать" - выбор и запуск разделены,
+     * тап по строке списка сам по себе ничего не запускает. После нажатия "Форматировать"
+     * идёт ещё один диалог-подтверждение (см. confirmFormat) - это уже финальный шаг.
+     */
+    private void showDeviceChooser(final List<String[]> devices) {
+        final String[] labels = new String[devices.size()];
+        for (int i = 0; i < devices.size(); i++) {
+            String[] d = devices.get(i);
+            String vendor = d[1].trim();
+            String model = d[2].trim();
+            String size = d[3].trim();
+            String fstype = d[4].trim();
+            labels[i] = d[0] + " - " + vendor + " " + model + ", " + size +
+                    (fstype.isEmpty() ? "" : ", сейчас " + fstype);
+        }
+        final int[] selected = {0};
+        new AlertDialog.Builder(this)
+                .setTitle("Какую карту форматировать?")
+                .setSingleChoiceItems(labels, 0, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        selected[0] = which;
+                    }
+                })
+                .setPositiveButton("Форматировать", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        confirmFormat(devices.get(selected[0]));
+                    }
+                })
+                .setNegativeButton("Отмена", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        append("отменено.");
+                        setBusy(false);
+                    }
+                })
+                .setOnCancelListener(new DialogInterface.OnCancelListener() {
+                    @Override
+                    public void onCancel(DialogInterface dialog) {
+                        append("отменено.");
+                        setBusy(false);
+                    }
+                })
+                .show();
+    }
+
+    private void confirmFormat(final String[] dev) {
+        final String name = dev[0];
+        String vendor = dev[1].trim();
+        String model = dev[2].trim();
+        String size = dev[3].trim();
+        new AlertDialog.Builder(this)
+                .setTitle("Стереть " + name + "?")
+                .setMessage(vendor + " " + model + ", " + size +
+                        "\n\nВСЕ данные на этой карте будут уничтожены безвозвратно.")
+                .setPositiveButton("Стереть", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        setBusy(false);
+                        runInBackground("> форматирую " + name + "...", new Job() {
+                            @Override
+                            public void run(Keeper.Progress p) {
+                                Keeper.runFormat(MainActivity.this, "--format=" + name, p);
+                            }
+                        });
+                    }
+                })
+                .setNegativeButton("Отмена", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        append("отменено.");
+                        setBusy(false);
+                    }
+                })
+                .setOnCancelListener(new DialogInterface.OnCancelListener() {
+                    @Override
+                    public void onCancel(DialogInterface dialog) {
+                        append("отменено.");
+                        setBusy(false);
+                    }
+                })
+                .show();
+    }
+
+    /**
+     * Открывает URL системным обработчиком ACTION_VIEW - на этой прошивке уже есть
+     * готовый webview-просмотрщик, поднимать второй смысла нет.
+     */
+    private void addUrlButton(String text, final String url) {
+        buttonsRow.addView(button(text, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                } catch (Exception e) {
+                    append("не удалось открыть " + url + ": " + e);
+                }
+            }
+        }));
+    }
+
+    // ------------------------------------------------------------------ каркас --
+
+    private interface Job {
+        void run(Keeper.Progress progress);
+    }
+
+    private void runInBackground(final String header, final Job job) {
+        if (busy) return;
+        setBusy(true);
+        append("");
+        append(header);
+        background(new Runnable() {
+            @Override
+            public void run() {
+                job.run(new Keeper.Progress() {
+                    @Override
+                    public void onLine(String line) {
+                        post(line);
+                    }
+                });
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                    }
+                });
+            }
+        });
+    }
+
+    private void setBusy(boolean b) {
+        busy = b;
+        for (int i = 0; i < buttonsRow.getChildCount(); i++) {
+            buttonsRow.getChildAt(i).setEnabled(!b);
+        }
+    }
+
+    private String versionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
+    private Button button(String text, View.OnClickListener l) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setOnClickListener(l);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 0, dp(12), 0);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private int dp(int v) {
+        return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
+    }
+
+    private void background(Runnable r) {
+        new Thread(r, "wwan-work").start();
+    }
+
+    private void post(final String text) {
+        ui.post(new Runnable() {
+            @Override
+            public void run() {
+                append(text);
+            }
+        });
+    }
+
+    private void append(String text) {
+        log.append(text + "\n");
+    }
+}

@@ -1,0 +1,19 @@
+app/build/
+app/keystore.jks
+*.idsig
+
+# копии из scripts/, tools/, modules/prebuilt - их кладёт app/build.sh перед линковкой
+app/assets/wwan-up.sh
+app/assets/wwan-boot.sh
+app/assets/dial.sh
+app/assets/at.sh
+app/assets/format-sdcard.sh
+app/assets/huawei-modeswitch
+app/assets/*.ko
+
+# генерируется modpost при сборке модулей
+modules/**/*.o
+modules/**/*.mod
+modules/**/*.mod.c
+modules/**/.*.cmd
+modules/**/modules.order

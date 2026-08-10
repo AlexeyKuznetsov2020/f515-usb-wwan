@@ -1,0 +1,9 @@
+# Копия -> /data/local/tmp/wwan.conf, читается wwan-up.sh при запуске.
+# Всё необязательно: без файла берутся значения по умолчанию.
+
+WWAN_APN=internet          # APN оператора (beeline: internet.beeline.kz)
+#WWAN_USER=                # логин, если оператор его требует
+#WWAN_PASS=                # пароль
+#WWAN_DIAL='*99#'          # номер дозвона
+#WWAN_TABLE=99             # таблица маршрутизации для ppp0
+#WWAN_MODDIR=/data/local/tmp   # где лежат .ko и huawei-modeswitch
