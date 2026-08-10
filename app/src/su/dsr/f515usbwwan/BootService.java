@@ -25,17 +25,28 @@ public class BootService extends Service {
     private static final int ADB_ATTEMPTS = 20;
 
     private static volatile boolean running = false;
+    /**
+     * После ребута прилетает два броадкаста подряд (LOCKED_BOOT_COMPLETED, следом
+     * BOOT_COMPLETED). Первый заход обычно успевает закончиться за пару секунд, поэтому
+     * одного признака "сейчас работает" мало - второй броадкаст запускал всю процедуру
+     * заново, и на стенде после ребута оставалось два сторожа. Этот признак живёт до
+     * конца жизни процесса, то есть до следующей загрузки.
+     */
+    private static volatile boolean alreadyRan = false;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         startForeground(NOTIFICATION_ID, notification("Поднимаю USB-модем после перезагрузки"));
 
         synchronized (BootService.class) {
-            if (running) {
-                Log.i(TAG, "boot: заход уже идёт, второй не нужен");
+            if (running || alreadyRan) {
+                Log.i(TAG, "boot: заход уже был в этой загрузке, второй не нужен");
+                stopForeground(true);
+                stopSelf();
                 return START_NOT_STICKY;
             }
             running = true;
+            alreadyRan = true;
         }
 
         new Thread(new Runnable() {

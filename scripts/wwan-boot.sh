@@ -144,8 +144,16 @@ if [ -n "$P" ] && kill -0 "$P" 2>/dev/null && [ "$P" != "$$" ]; then
 	exit 0
 fi
 
+# Занимаем pidfile СРАЗУ, до задержки и до подъёма. Иначе после ребута
+# получается гонка: BOOT_COMPLETED прилетает следом за LOCKED_BOOT_COMPLETED,
+# приложение запускает нас дважды с разницей в пару секунд, обе копии видят
+# пустой pidfile, обе поднимают модем и обе остаются сторожить. Проверено на
+# стенде: после первого же ребута работали два экземпляра.
+echo $$ >"$PIDFILE"
+trap 'rm -f "$PIDFILE"; exit 0' TERM INT
+
 [ -x "$UP" ] || chmod 755 "$UP" 2>/dev/null
-[ -f "$UP" ] || { log "нет $UP — нечего запускать"; exit 1; }
+[ -f "$UP" ] || { log "нет $UP — нечего запускать"; rm -f "$PIDFILE"; exit 1; }
 
 if [ "$NOW_MODE" = 0 ] && [ "$BOOT_DELAY" -gt 0 ]; then
 	log "жду $BOOT_DELAY с, пока система догрузится"
@@ -178,9 +186,7 @@ bring_up() {
 bring_up
 
 # ------------------------------------------------------------ watchdog ------
-echo $$ >"$PIDFILE"
-trap 'rm -f "$PIDFILE"; exit 0' TERM INT
-
+# pidfile уже занят выше, перед задержкой — здесь заново его писать не нужно.
 log "watchdog: проверка каждые $WATCH_INTERVAL с (не больше $MAX_RESTARTS_PER_HOUR перезапусков в час)"
 
 soft_fails=0
