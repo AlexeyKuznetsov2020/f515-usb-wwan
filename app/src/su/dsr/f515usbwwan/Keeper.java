@@ -22,9 +22,9 @@ public class Keeper {
     static final String ADB_HOST = "127.0.0.1";
     static final int ADB_PORT = 5555;
 
-    /** 130s: worst case inside wwan-up.sh is modeswitch reconnect (20s) + network
-     *  registration (30s) + dial timeout (45s) + margin. */
-    private static final int RUN_TIMEOUT_MS = 130000;
+    /** 180s: worst case inside wwan-up.sh is modeswitch reconnect (20s) + network
+     *  registration (30s) + dial timeout (60s) + margin. */
+    private static final int RUN_TIMEOUT_MS = 180000;
 
     /** name in assets/, path on device, executable bit */
     private static final Object[][] FILES = {

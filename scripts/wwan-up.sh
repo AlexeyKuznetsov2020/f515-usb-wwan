@@ -220,18 +220,29 @@ load_module() {
 # она виртуальная, а toybox stty на этом драйвере её выставить не может и тогда
 # отбрасывает всю команду целиком. -iuclc обязателен — иначе порт отдаёт ответы
 # в нижнем регистре ("ok" вместо "OK").
+#
+# Открытие порта и чтение из него живут в подоболочке, и это не косметика:
+# скрипт, запущенный через `adb shell 'sh wwan-up.sh'` (без pty), оказывается
+# лидером сессии без управляющего терминала, и тогда открытие /dev/ttyUSB1
+# делает этот порт управляющим терминалом. Дальше любое чтение из фоновой
+# группы процессов ловит SIGTTIN и останавливается НАВСЕГДА - скрипт висит на
+# стадии 8 и его приходится убивать. Форкнутый ребёнок лидером сессии не
+# является, поэтому ctty не захватывается вообще. Под приложением проблема не
+# видна: там pty уже есть, и ttyUSB управляющим стать не может.
+# --foreground - второй слой той же защиты: toybox timeout по умолчанию уводит
+# ребёнка в собственную группу процессов, то есть в фоновую.
 at() {
 	_tty=$1
 	_cmd=$2
 	_wait=${3:-2}
 	[ -c "$_tty" ] || return 1
 	stty -F "$_tty" raw -echo -iuclc min 0 time 5 >/dev/null 2>&1
-	exec 9<>"$_tty" || return 1
-	timeout 1 cat <&9 >/dev/null 2>&1
-	printf '%s\r' "$_cmd" >&9
-	_out=$(timeout "$_wait" cat <&9 | tr -d '\r')
-	exec 9<&-
-	printf '%s' "$_out"
+	(
+		exec 9<>"$_tty" || exit 1
+		timeout --foreground 1 cat <&9 >/dev/null 2>&1
+		printf '%s\r' "$_cmd" >&9
+		timeout --foreground "$_wait" cat <&9 | tr -d '\r'
+	)
 }
 
 iface_addr() { ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1; }
@@ -574,8 +585,26 @@ if [ "$MODE" = ppp ]; then
 		say "   [dry ] pppd $MODEM_TTY ... connect $DIAL_SH"
 	else
 		if pidof pppd >/dev/null 2>&1; then
-			warn "pppd уже запущен, но ppp0 без адреса — ждём"
-		else
+			# Даём ему шанс: возможно, дозвон идёт прямо сейчас.
+			_w=0
+			while [ $_w -lt 10 ] && [ -z "$ADDR" ] && pidof pppd >/dev/null 2>&1; do
+				sleep 1
+				_w=$((_w + 1))
+				ADDR=$(iface_addr ppp0)
+			done
+		fi
+		if [ -n "$ADDR" ]; then
+			ok "ppp0 поднялся сам: $ADDR"
+		elif pidof pppd >/dev/null 2>&1; then
+			# Живой pppd без адреса — это зависший pppd (обычно встал на
+			# connect-скрипте, когда модем остался в data-режиме). Он держит
+			# модемный порт, поэтому просто ждать бессмысленно: снимаем его,
+			# иначе ни одна следующая попытка не начнётся.
+			warn "pppd запущен, но ppp0 без адреса — снимаю зависший pppd"
+			kill -9 $(pidof pppd) 2>/dev/null
+			sleep 2
+		fi
+		if [ -z "$ADDR" ]; then
 			# nodefaultroute — принципиально: подмена основного маршрута оборвала бы
 			# управляющий adb. Маршрутизацией занимается отдельная стадия ниже.
 			_auth=""
@@ -590,7 +619,7 @@ if [ "$MODE" = ppp ]; then
 		fi
 
 		i=0
-		while [ $i -lt 45 ]; do
+		while [ $i -lt 60 ]; do
 			ADDR=$(iface_addr ppp0)
 			[ -n "$ADDR" ] && break
 			pidof pppd >/dev/null 2>&1 || break
@@ -599,6 +628,9 @@ if [ "$MODE" = ppp ]; then
 		done
 
 		if [ -z "$ADDR" ]; then
+			# Уходим с ошибкой — но не оставляем за собой pppd, который держит
+			# модемный порт: следующая попытка должна начинаться с чистого места.
+			pidof pppd >/dev/null 2>&1 && kill -9 $(pidof pppd) 2>/dev/null
 			say "   последние строки $PPP_LOG:"
 			tail -n 12 "$PPP_LOG" 2>/dev/null | tr -d '\r' | while read -r l; do say "      $l"; done
 			_t=$(tail -n 40 "$PPP_LOG" 2>/dev/null)
