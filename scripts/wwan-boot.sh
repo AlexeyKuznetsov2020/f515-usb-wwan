@@ -80,6 +80,28 @@ log() {
 	echo "$*"
 }
 
+# Усечение логов: logrotate на голове нет, а все файлы только дописываются.
+# Перевалил за LOG_MAX — оставляем последнюю половину. Пишем в ТОТ ЖЕ inode
+# (`cat`, а не `mv`): tbox.log держит открытым живой tboxwire, и подмена файла
+# оставила бы его писать в отвязанный inode — место на флеше не освободилось бы,
+# а видимый файл замер бы навсегда.
+LOG_MAX=${WWAN_LOG_MAX:-5242880}
+log_trim() {
+	for _lt_f in "$@"; do
+		[ -f "$_lt_f" ] || continue
+		_lt_sz=$(stat -c %s "$_lt_f" 2>/dev/null) || continue
+		[ "$_lt_sz" -gt "$LOG_MAX" ] 2>/dev/null || continue
+		log "усекаю $_lt_f: $_lt_sz байт больше потолка $LOG_MAX"
+		tail -c $((LOG_MAX / 2)) "$_lt_f" >"$_lt_f.trim" 2>/dev/null &&
+			cat "$_lt_f.trim" >"$_lt_f" 2>/dev/null
+		rm -f "$_lt_f.trim" 2>/dev/null
+	done
+}
+
+# Все логи проекта в одном месте: сторож — единственный, кто работает постоянно,
+# и следить за размерами удобнее ему. ppp.log сюда же, хотя пишет его pppd.
+LOG_FILES="$LOG $STATE/boot-stdout.log $STATE/tbox.log /data/local/tmp/wwan.log /data/local/tmp/ppp.log"
+
 disable() {
 	echo "$(date '+%F %T') $1" >"$DISABLED"
 	sync
@@ -227,7 +249,12 @@ bring_up() {
 	_try=1
 	while :; do
 		log "--- wwan-up.sh --system --boot (заход $((_a + 1)), попытка $_try/$BRINGUP_RETRIES) ---"
-		sh "$UP" --system --boot >>"$LOG" 2>&1
+		# Вывод wwan-up.sh в boot.log НЕ перенаправляем: он и так пишет каждую
+		# свою строку в wwan.log со своими отметками времени, и копия здесь
+		# означала бы вторую запись тех же двух-трёх килобайт на флеш за заход.
+		# Наружу вывод всё же идёт: запущенному руками он нужен на экране, а у
+		# отцепленного сторожа stdout уводит в /dev/null само приложение.
+		sh "$UP" --system --boot
 		_rc=$?
 		# Управление вернулось — значит голова пережила заход, что бы там ни было
 		# с модемом. Именно это и обнуляет счётчик (см. шапку файла).
@@ -245,7 +272,7 @@ bring_up() {
 		sleep "$BRINGUP_RETRY_DELAY"
 		_try=$((_try + 1))
 	done
-	log "подъём не удался (rc=$_rc), подробности выше и в wwan.log"
+	log "подъём не удался (rc=$_rc), подробности в wwan.log"
 	return 1
 }
 
@@ -327,6 +354,8 @@ while :; do
 	# Иконка сотовой сети живёт отдельным процессом и к связи отношения не имеет:
 	# проверяем её тут же, но молча и не влияя ни на что (см. docs/status-icon.md).
 	[ -x "$DIR/tbox-icon.sh" ] && sh "$DIR/tbox-icon.sh" auto >/dev/null 2>&1
+
+	log_trim $LOG_FILES
 
 	IF=$(wan_iface)
 	if [ -z "$IF" ]; then
