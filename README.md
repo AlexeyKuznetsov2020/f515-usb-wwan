@@ -7,6 +7,7 @@
 | Тип | Примеры | Что нужно |
 |---|---|---|
 | **HiLink** (модем сам роутер, CDC-Ethernet/RNDIS) | ZTE MF833R | ничего — ядро головы уже умеет `cdc_ether`, нужен только DHCP |
+| **HiLink на NCM** (тот же роутер, но канал данных — NCM за vendor-классом `ff/02/16`) | Huawei E8278 / E8372 / E3372 | три модуля ядра (`cdc-wdm`, `cdc_ncm`, `huawei_cdc_ncm`), дальше тот же DHCP — всё есть в репозитории |
 | **PPP** (модем отдаёт AT/PPP-порты, `12d1:*`) | Huawei E17x / E1750 / E3272 | modeswitch + два модуля ядра + дозвон pppd — всё есть в репозитории |
 
 ![Успешный запуск: приложение на приборной панели, все стадии отработали, интернет есть](docs/img/screenshot.png)
@@ -74,7 +75,7 @@ TBOX'ом и отдаёт голове по SOME/IP реальные цифры 
 | `scripts/format-sdcard.sh` | список съёмных карт и форматирование выбранной |
 | `scripts/tbox-icon.sh` | иконка сотовой сети: запуск/остановка/состояние |
 | `tbox/` | исходник `TboxWire.java` (эмуляция TBOX по SOME/IP), сборка, готовый jar |
-| `modules/` | исходники `usbserialmerged2`/`ppp_async`, готовые `.ko`, скрипт пересборки |
+| `modules/` | исходники `usbserialmerged2`/`ppp_async`/NCM-тройки, готовые `.ko`, скрипт пересборки |
 | `tools/` | `huawei-modeswitch` — modeswitch без Frida/usb_modeswitch, исходник + сборка |
 | `app/` | Android-приложение (кнопки над теми же скриптами), исходники + готовый APK |
 

@@ -10,6 +10,8 @@ adb shell mkdir -p /data/local/tmp/wwan
 adb push scripts/wwan-up.sh scripts/wwan-boot.sh scripts/dial.sh scripts/at.sh \
          scripts/format-sdcard.sh \
          modules/prebuilt/usbserialmerged2.ko modules/prebuilt/ppp_async.ko \
+         modules/prebuilt/cdc-wdm.ko modules/prebuilt/cdc_ncm.ko \
+         modules/prebuilt/huawei_cdc_ncm.ko \
          tools/huawei-modeswitch \
          /data/local/tmp/wwan/
 adb shell chmod 755 /data/local/tmp/wwan/*.sh /data/local/tmp/wwan/huawei-modeswitch
@@ -32,7 +34,8 @@ adb shell WWAN_APN=internet.beeline.kz /data/local/tmp/wwan/wwan-up.sh --system
 ## Как это устроено
 
 `scripts/wwan-up.sh` сначала **сам определяет тип модема**: если в системе появился
-USB-сетевой интерфейс (`cdc_ether`/`rndis_host`) — это HiLink, идём коротким путём; если
+USB-сетевой интерфейс (`cdc_ether`/`rndis_host`/`cdc_ncm`/`huawei_cdc_ncm`) — это HiLink,
+идём коротким путём; если
 на шине висит `12d1:*` — это Huawei, идём длинным. Принудительно тип задаётся
 `WWAN_MODE=hilink|ppp`. Если не нашлось ни того, ни другого, скрипт печатает дамп
 `lsusb`/интерфейсов и останавливается.
@@ -44,11 +47,31 @@ USB-сетевой интерфейс (`cdc_ether`/`rndis_host`) — это HiLi
 (идемпотентно): можно жать «Включить» сколько угодно раз, в том числе на уже поднятой
 сети.
 
+До определения типа идут две общие стадии: **режим модема** (Huawei приходит на шину
+виртуальным CD-ROM'ом, переключается SCSI-командой) и **NCM-интерфейс Huawei** (см. ниже).
+
 HiLink-ветка: поднять интерфейс → дождаться carrier → `udhcpc` → адрес/шлюз → маршруты.
-PPP-ветка: файлы → USB-устройство → modeswitch → модуль usbserial → последовательные
-порты → PPP в ядре → SIM/регистрация → дозвон pppd → маршруты. Общий хвост у обеих веток
-один: маршрут в служебную таблицу 99, проверка связи и (по `--system`) раздача интернета
-приложениям.
+PPP-ветка: файлы → модуль usbserial → последовательные порты → PPP в ядре →
+SIM/регистрация → дозвон pppd → маршруты. Общий хвост у обеих веток один: маршрут в
+служебную таблицу 99, проверка связи и (по `--system`) раздача интернета приложениям.
+
+### NCM-модемы Huawei (E8278 и родня)
+
+Часть Huawei с HiLink-прошивкой отдаёт канал данных не AT/PPP-портом, а NCM-интерфейсом,
+спрятанным за vendor-specific классом `ff/02/16`. Ни `cdc_ncm`, ни `huawei_cdc_ncm`, ни
+`cdc-wdm` в ядре головы не собраны, зато собран каркас `usbnet` — поэтому три драйвера
+довозятся модулями так же, как `usbserial` для PPP-ветки. Стадия «NCM-интерфейс Huawei»
+грузит их и, если NCM-интерфейс успел забрать `option` (он матчит всё устройство
+`12d1:1506` целиком), передаёт интерфейс правильному драйверу:
+
+```sh
+printf %s 4-1:1.1 > /sys/bus/usb/drivers/option/unbind
+printf %s 4-1:1.1 > /sys/bus/usb/drivers/huawei_cdc_ncm/bind
+```
+
+После этого появляется `wwan0`, и модем идёт дальше как обычный HiLink — DHCP и маршруты.
+Разбор конкретного случая (Huawei E8278), со сборкой модулей и проверками перед
+`insmod`, — в [ncm-e8278.md](ncm-e8278.md).
 
 `--check` прогоняет все проверки в режиме «только посмотреть», ничего не меняя на
 устройстве — полезно как первый шаг диагностики.

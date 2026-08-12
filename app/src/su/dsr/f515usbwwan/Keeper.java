@@ -49,6 +49,12 @@ public class Keeper {
             {"huawei-modeswitch", "huawei-modeswitch", Boolean.TRUE},
             {"usbserialmerged2.ko", "usbserialmerged2.ko", Boolean.FALSE},
             {"ppp_async.ko", "ppp_async.ko", Boolean.FALSE},
+            // NCM-ветка: Huawei с HiLink-прошивкой (E8278 и родня) отдаёт данные
+            // сетевым интерфейсом, а не AT/PPP-портом; этих трёх драйверов в ядре
+            // головы нет — см. стадию "NCM-интерфейс Huawei" в wwan-up.sh.
+            {"cdc-wdm.ko", "cdc-wdm.ko", Boolean.FALSE},
+            {"cdc_ncm.ko", "cdc_ncm.ko", Boolean.FALSE},
+            {"huawei_cdc_ncm.ko", "huawei_cdc_ncm.ko", Boolean.FALSE},
     };
 
     private static final Object LOCK = new Object();

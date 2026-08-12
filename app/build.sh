@@ -7,7 +7,7 @@
 # разъезжается с оригиналом ровно в тот момент, когда про неё забываешь.
 set -euo pipefail
 
-SDK=/home/dsultanr/android-sdk
+SDK=${ANDROID_SDK:-/home/dsultanr/android-sdk}
 BT=$SDK/android-14
 PLATFORM=$SDK/android-11/android.jar
 PROJ=$(cd "$(dirname "$0")" && pwd)
@@ -22,8 +22,16 @@ for f in "$ROOT"/scripts/wwan-up.sh "$ROOT"/scripts/wwan-boot.sh \
          "$ROOT"/scripts/dial.sh "$ROOT"/scripts/at.sh "$ROOT"/scripts/format-sdcard.sh \
          "$ROOT"/scripts/tbox-icon.sh "$ROOT"/tbox/prebuilt/tboxwire.jar \
          "$ROOT"/tools/huawei-modeswitch \
-         "$ROOT"/modules/prebuilt/usbserialmerged2.ko "$ROOT"/modules/prebuilt/ppp_async.ko; do
-    cp -f "$f" "$PROJ/assets/"
+         "$ROOT"/modules/prebuilt/usbserialmerged2.ko "$ROOT"/modules/prebuilt/ppp_async.ko \
+         "$ROOT"/modules/prebuilt/cdc-wdm.ko "$ROOT"/modules/prebuilt/cdc_ncm.ko \
+         "$ROOT"/modules/prebuilt/huawei_cdc_ncm.ko; do
+    case "$f" in
+    # Чекаут под Windows (core.autocrlf=true) отдаёт скрипты с CRLF, а
+    # /system/bin/sh на голове давится на \r - нормализуем при копировании.
+    # На Linux-чекауте убирать нечего, поведение то же.
+    *.sh) sed 's/\r$//' "$f" > "$PROJ/assets/$(basename "$f")" ;;
+    *)    cp -f "$f" "$PROJ/assets/" ;;
+    esac
     echo "   $(basename "$f")"
 done
 # adbkey/adbkey.pub лежат в assets/ постоянно - это не копия, а оригинал.

@@ -59,12 +59,27 @@ python3 mkadbpub.py assets/adbkey "you@host" > assets/adbkey.pub
 ## Сборка
 
 ```bash
-./build.sh          # -> F515UsbWwanApp.apk
+./build.sh                              # -> F515UsbWwanApp.apk
+ANDROID_SDK=~/android-sdk ./build.sh    # если SDK лежит не по умолчанию
 ```
 
 `assets → aapt2 → javac → d8 → zipalign → apksigner`, без gradle. Нужен Android SDK
 (`aapt2`/`d8`/`zipalign`/`apksigner`, платформа `android-11`+) и JDK. `keystore.jks`
 создаётся автоматически при первой сборке.
+
+Раскладка SDK, которую ждёт скрипт, — ровно та, что получается распаковкой официальных
+zip'ов Google, без `sdkmanager`:
+
+```bash
+mkdir -p ~/android-sdk && cd ~/android-sdk
+curl -O https://dl.google.com/android/repository/build-tools_r34-linux.zip  # -> android-14/
+curl -O https://dl.google.com/android/repository/platform-30_r03.zip        # -> android-11/
+unzip -q build-tools_r34-linux.zip && unzip -q platform-30_r03.zip
+```
+
+Ключ подписи в репозиторий не кладётся, поэтому у собранного своими руками APK подпись
+будет **другая**, чем у выложенного в репозитории: обновиться «поверх» установленного
+приложения такой APK не даст — сначала удалить старое.
 
 R.java при такой сборке не генерируется (`aapt2 link` вызывается без `--java`), поэтому
 из кода нельзя сослаться на собственный ресурс — иконка уведомления берётся из
