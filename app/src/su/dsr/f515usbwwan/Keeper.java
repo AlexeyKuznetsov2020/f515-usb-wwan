@@ -114,8 +114,20 @@ public class Keeper {
                 if (!uid.startsWith("0")) {
                     line(progress, sb, "WARNING: adbd is not root, this will fail");
                 }
-                adb.shell("mkdir -p " + DIR);
+                adb.shell("mkdir -p " + DIR + "/state");
+                // Признак «идут проверки автозапуска» — под него иконка мигает крестиком и
+                // полной шкалой. Ставится до раскладки файлов: она сама по себе не мгновенна,
+                // а сразу за ней wwan-boot.sh ждёт ещё 45 секунд, пока догрузится система.
+                adb.shell("echo 1 > " + DIR + "/state/appboot");
                 deployMissing(ctx, adb, progress, sb);
+                // Иконку поднимаем здесь, а не внутри wwan-up.sh: та стадия начнётся минуту
+                // спустя, а показывать «автозапуск работает» надо уже сейчас. Молча и без
+                // права что-либо уронить — к подъёму модема иконка отношения не имеет.
+                adb.shell("sh " + ICON + " auto >/dev/null 2>&1");
+                // Признак здесь НЕ снимаем: сразу за запуском wwan-boot.sh ждёт 45 секунд,
+                // пока догрузится система, и всё это время показывать всё ещё нечего.
+                // Снимет его wwan-up.sh, когда действительно начнёт подъём, — там же
+                // начинается вторая анимация, так что наложиться они не могут.
                 String out = adb.shell(launchCmd(false));
                 line(progress, sb, "запуск wwan-boot.sh: " + out.trim());
             } catch (Exception e) {

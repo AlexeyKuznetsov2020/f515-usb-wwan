@@ -113,12 +113,22 @@ public final class TboxWire {
     static int tcpPort = 30542;
     static int offerMs = 1000;   // cyclic_offer_delay из SdConfig
     static int notifyMs = 5000;
-    /**
-     * Такт анимации «идёт подключение»: 5 шагов по 0.5 с — полный пробег палок за 2.5 с.
-     * Опрос модема при этом чаще не становится: readSignal() кеширует его на MODEM_POLL_MS,
-     * а анимация подменяет только число палок.
-     */
+    // Фазы уведомлений. IDLE — обычный режим, шлём то, что намерил модем; остальные две
+    // рисуют анимацию вместо заглушки, каждая со своим тактом. Опрос модема от этого чаще
+    // не становится: readSignal() кеширует его на MODEM_POLL_MS, анимация подменяет только
+    // то, что уходит на провод.
+    static final int PHASE_IDLE = 0;
+    /** Приложение дождалось adbd и проверяет файлы: крестик ↔ полная шкала раз в секунду. */
+    static final int PHASE_APPCHECK = 1;
+    /** Работает wwan-up.sh: палки бегут по кругу 0→4, полный пробег за 2.5 с. */
+    static final int PHASE_BRINGUP = 2;
+
+    static final int APPCHECK_NOTIFY_MS = 1000;
     static final int CONNECTING_NOTIFY_MS = 500;
+
+    static int phaseTickMs(int phase) {
+        return phase == PHASE_APPCHECK ? APPCHECK_NOTIFY_MS : CONNECTING_NOTIFY_MS;
+    }
     static int ttl = 3;          // TTL из SdConfig; в SD это секунды жизни оффера
     static int fixedStrength = Integer.MIN_VALUE;  // MIN_VALUE == брать реальный сигнал модема
     static boolean probeOnly = false;  // только offer + дамп входящего, без TCP и событий
@@ -355,32 +365,43 @@ public final class TboxWire {
             public void run() {
                 int n = 0;
                 int tick = 0;
-                boolean wasConnecting = false;
+                int phase = PHASE_IDLE;
                 while (true) {
                     try {
-                        // Пока идёт подъём — такт чаще: на 5 секундах «бег» палок
-                        // выглядит не движением, а случайными скачками уровня.
-                        Thread.sleep(wasConnecting ? CONNECTING_NOTIFY_MS : notifyMs);
+                        // Такт задаёт текущая фаза: на пяти секундах и «бег» палок, и
+                        // мигание выглядят не движением, а случайными скачками уровня.
+                        Thread.sleep(phase == PHASE_IDLE ? notifyMs : phaseTickMs(phase));
                     } catch (InterruptedException e) { return; }
                     Sig sig = readSignal();
-                    // Настоящего уровня ещё нет, а подъём прямо сейчас идёт: гоняем палки.
-                    // Условие именно про measured, а не про reg == REG_NONE (как было
-                    // сначала): пока модем не ответил, наружу уходит правдоподобная заглушка
-                    // «4G, три палки» — genToReg(null) + STRENGTH_WHEN_UNKNOWN, — и по
-                    // крестику стадию подъёма не поймать, его просто не бывает. На стенде
-                    // из-за этого анимация не показалась ни разу: весь подъём в логе стоял
-                    // reg=6 strength=3 (линка ещё нет, CSQ неизвестен).
+                    // Настоящего уровня ещё нет — значит, возможно, идёт одна из двух ранних
+                    // стадий, и вместо заглушки надо показать, что процесс живой.
+                    //
+                    // Стадии РОВНО ДВЕ и они не пересекаются: сначала приложение проверяет
+                    // adbd и раскладывает файлы (state/appboot=1), потом работает wwan-up.sh
+                    // (state/busy с живым pid). Приложение снимает appboot прямо перед
+                    // запуском подъёма, так что в норме одновременно они не стоят; но если
+                    // приложение почему-то не успело снять признак, побеждает подъём — он
+                    // позже и конкретнее. Порядок проверок ниже это и задаёт, поэтому
+                    // «моргание» не может перебить «бегущие палки».
+                    int next = PHASE_IDLE;
                     if (!sig.measured) {
                         String stage = bringUpStage();
-                        wasConnecting = stage != null;
-                        if (wasConnecting) {
+                        if (stage != null) {
+                            next = PHASE_BRINGUP;
                             sig = new Sig(REG_STATUS_REGISTERED, connectingStrength(tick++),
                                     "подключение: " + stage);
+                        } else if (appChecking()) {
+                            next = PHASE_APPCHECK;
+                            boolean full = (tick++ & 1) == 0;
+                            sig = full
+                                    ? new Sig(REG_STATUS_REGISTERED, 5, "автозапуск: проверки")
+                                    : new Sig(REG_NONE, -1, "автозапуск: проверки");
                         }
-                    } else {
-                        wasConnecting = false;
-                        tick = 0;
                     }
+                    // Фаза сменилась — счёт кадров начинается заново, иначе новая анимация
+                    // подхватывает чужой такт и первый кадр выпадает случайным.
+                    if (next != phase) tick = 0;
+                    phase = next;
                     byte[] msg = buildNotification(buildPayload(sig.reg, ESIM_STATUS_OK,
                             SERVICE_STATUS_CONNECTED, ROAMING_NONE, sig.strength, 0));
                     n++;
@@ -847,6 +868,30 @@ public final class TboxWire {
     // pid, дальше название стадии. Сверяем cmdline, потому что файл переживает и падение
     // скрипта, и перезагрузку: без этого анимация осталась бы навсегда, обещая подключение,
     // которого никто не делает. Умер скрипт — со следующего же уведомления честный крестик.
+
+    /**
+     * Идут ли прямо сейчас проверки приложения перед подъёмом.
+     *
+     * Это стадия ДО wwan-up.sh: BootService дождался adbd, сверяет и раскладывает файлы,
+     * потом ждёт 45 секунд «пока система догрузится» (WWAN_BOOT_DELAY в wwan-boot.sh).
+     * Минута с лишним, в которую никто ничего не поднимает и показывать нечего, а
+     * пользователю важно видеть, что автозапуск не забыл про него. Признак пишет само
+     * приложение (state/appboot: 1 — идут проверки, 0 — уже запустило подъём).
+     *
+     * Здесь возраст файла, а не pid: писатель — процесс приложения, который живёт и после
+     * того, как проверки кончились, так что по нему судить не о чем. Возраст страхует от
+     * файла с единицей, оставшегося от упавшего приложения; окно щедрое, но это всё равно
+     * потолок, а не ожидаемая длительность — нормально признак снимается явно.
+     */
+    static final long APPBOOT_MAX_AGE_MS = 5 * 60 * 1000;
+
+    static boolean appChecking() {
+        java.io.File f = new java.io.File(wwanDir + "/state/appboot");
+        if (!f.isFile()) return false;
+        if (System.currentTimeMillis() - f.lastModified() > APPBOOT_MAX_AGE_MS) return false;
+        String s = readFirstLine(f.getPath());
+        return s != null && s.trim().startsWith("1");
+    }
 
     /** Название текущей стадии подъёма, или null, если прямо сейчас никто ничего не поднимает. */
     static String bringUpStage() {
