@@ -68,6 +68,19 @@ read_num() { n=$(cat "$1" 2>/dev/null); case "$n" in ''|*[!0-9]*) echo 0 ;; *) e
 
 wan_iface() { cat "$WAN_FILE" 2>/dev/null; }
 
+# Живой ли записанный watchdog: печатает его pid или ничего. Проверка cmdline
+# обязательна — pidfile переживает перезагрузку, и номер вполне может оказаться
+# занят посторонним процессом (см. подробности у проверки экземпляра ниже).
+# Для --stop это ещё и вопрос безопасности: по голому `kill -0` мы бы отстрелили
+# чужой процесс.
+watchdog_pid() {
+	_w=$(cat "$PIDFILE" 2>/dev/null)
+	[ -n "$_w" ] || return 1
+	kill -0 "$_w" 2>/dev/null || return 1
+	grep -qs wwan-boot /proc/$_w/cmdline || return 1
+	echo "$_w"
+}
+
 iface_addr() { ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1; }
 
 # ------------------------------------------------------------ команды UI ----
@@ -79,8 +92,8 @@ case "$1" in
 	echo "max_attempts=$MAX_ATTEMPTS"
 	echo "inflight=$([ -f "$INFLIGHT" ] && echo 1 || echo 0)"
 	echo "last_ok=$(cat "$LAST_OK" 2>/dev/null)"
-	_p=$(cat "$PIDFILE" 2>/dev/null)
-	if [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; then
+	_p=$(watchdog_pid)
+	if [ -n "$_p" ]; then
 		echo "watchdog=1 pid=$_p"
 	else
 		echo "watchdog=0"
@@ -99,8 +112,8 @@ case "$1" in
 	disable "выключено вручную"
 	exit 0 ;;
 --stop)
-	_p=$(cat "$PIDFILE" 2>/dev/null)
-	if [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; then
+	_p=$(watchdog_pid)
+	if [ -n "$_p" ]; then
 		kill "$_p" && log "watchdog остановлен (pid $_p)"
 	else
 		log "watchdog не запущен"
@@ -138,11 +151,22 @@ if [ "$A" -ge "$MAX_ATTEMPTS" ]; then
 fi
 
 # Уже работает другой экземпляр — второй watchdog не нужен.
+#
+# Одного `kill -0` тут мало, и это не теория: pidfile лежит в /data и переживает
+# перезагрузку, а номера pid на раннем старте раздаются почти детерминированно.
+# 2026-08-11 после двух ребутов подряд в pidfile оставался pid 5681 от прошлой
+# загрузки, на 45-й секунде аптайма этот номер был занят посторонним процессом —
+# и автозапуск оба раза выходил с «уже работает экземпляр», модем не поднимался
+# вообще, хотя приложение честно рапортовало, что автозапуск включён. Поэтому
+# проверяем не «номер занят», а «занят именно нами»: cmdline процесса должен
+# содержать имя этого скрипта.
 P=$(cat "$PIDFILE" 2>/dev/null)
-if [ -n "$P" ] && kill -0 "$P" 2>/dev/null && [ "$P" != "$$" ]; then
+if [ -n "$P" ] && [ "$P" != "$$" ] && kill -0 "$P" 2>/dev/null &&
+   grep -qs wwan-boot /proc/$P/cmdline; then
 	log "уже работает экземпляр (pid $P) — выхожу"
 	exit 0
 fi
+[ -n "$P" ] && [ "$P" != "$$" ] && log "pidfile от прошлой загрузки (pid $P мёртв или чужой) — забираю себе"
 
 # Занимаем pidfile СРАЗУ, до задержки и до подъёма. Иначе после ребута
 # получается гонка: BOOT_COMPLETED прилетает следом за LOCKED_BOOT_COMPLETED,
@@ -197,6 +221,10 @@ while :; do
 		log "watchdog: появился файл-выключатель — выхожу"
 		break
 	fi
+
+	# Иконка сотовой сети живёт отдельным процессом и к связи отношения не имеет:
+	# проверяем её тут же, но молча и не влияя ни на что (см. docs/status-icon.md).
+	[ -x "$DIR/tbox-icon.sh" ] && sh "$DIR/tbox-icon.sh" auto >/dev/null 2>&1
 
 	IF=$(wan_iface)
 	if [ -z "$IF" ]; then
