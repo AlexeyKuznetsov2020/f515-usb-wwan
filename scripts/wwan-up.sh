@@ -474,7 +474,12 @@ if [ "$MODE" = ppp ]; then
 	load_module "$KO_USB" usbserialmerged2 /sys/bus/usb/drivers/option
 
 	stage "последовательные порты"
-	if [ "$CHECK_ONLY" = 1 ] && [ ! -e /sys/bus/usb/drivers/option ]; then
+	if [ "$CHECK_ONLY" = 1 ] && [ "$NEED_SWITCH" = 1 ]; then
+		# В сухом прогоне modeswitch только печатается, но не выполняется, поэтому
+		# модем так и остался флешкой и AT/PPP-интерфейсов на шине физически нет.
+		# Это не поломка, а прямое следствие --check, и советовать тут dmesg вредно.
+		skip "модем ещё в storage-режиме (в --check modeswitch не выполняется) — портам взяться неоткуда"
+	elif [ "$CHECK_ONLY" = 1 ] && [ ! -e /sys/bus/usb/drivers/option ]; then
 		skip "модуль не загружен (--check), порты проверить нечем"
 	else
 		i=0
@@ -781,5 +786,10 @@ say "   лог:       $LOG"
 if [ "$CHECK_ONLY" = 0 ] && [ -n "$ADDR" ]; then
 	mkdir -p "$STATE" 2>/dev/null
 	echo "$WAN_IF" >"$STATE/wan-iface" 2>/dev/null
+	# Иконка сотовой сети в статус-баре: показать сигнал этого модема вместо крестика.
+	# Отдельный отцепленный процесс, к подъёму модема отношения не имеет — поэтому и
+	# запускается последним, молча и без права уронить результат (см. tbox-icon.sh auto
+	# и docs/status-icon.md).
+	[ -x "$DIR/tbox-icon.sh" ] && sh "$DIR/tbox-icon.sh" auto 2>&1 | sed 's/^/   /'
 fi
 exit 0

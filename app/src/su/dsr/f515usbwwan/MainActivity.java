@@ -57,6 +57,7 @@ public class MainActivity extends Activity {
         addRunButton("Включить", "--system");
         addRunButton("Выключить", "--down");
         addAutostartButton();
+        addIconButton();
         addUrlButton("Интернетометр", SPEEDTEST_URL);
         addFormatButton();
         HorizontalScrollView buttonsScroll = new HorizontalScrollView(this);
@@ -210,6 +211,90 @@ public class MainActivity extends Activity {
                 }
             });
         }
+        b.show();
+    }
+
+    /**
+     * Иконка сотовой сети в статус-баре. Как и автозапуск, это не разовое действие, а
+     * состояние, которое живёт само по себе, поэтому сначала спрашиваем голову, что там
+     * сейчас, и только потом показываем выбор.
+     */
+    private void addIconButton() {
+        buttonsRow.addView(button("Иконка сети", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (busy) return;
+                setBusy(true);
+                append("");
+                append("> Иконка сети: читаю состояние...");
+                background(new Runnable() {
+                    @Override
+                    public void run() {
+                        final String out = Keeper.runIcon(MainActivity.this, "status", null);
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                setBusy(false);
+                                showIconDialog(out);
+                            }
+                        });
+                    }
+                });
+            }
+        }));
+    }
+
+    private void showIconDialog(String status) {
+        final boolean running = value(status, "running").equals("1");
+
+        StringBuilder msg = new StringBuilder();
+        msg.append("Штатная иконка мобильной сети показывает сигнал USB-модема ")
+                .append("вместо крестика: голове отдаётся то, что в машине отдавал бы блок TBOX.\n\n");
+        msg.append("Сейчас: ").append(running ? "работает" : "не запущена").append('\n');
+        msg.append("После подъёма модема: ").append(value(status, "enabled").equals("1")
+                ? "включается сама" : "не включается (выключено вручную)").append('\n');
+        msg.append("\nНа сам интернет это никак не влияет — только на картинку в статус-баре.");
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+                .setTitle("Иконка сотовой сети")
+                .setMessage(msg.toString());
+
+        if (running) {
+            b.setNegativeButton("Выключить", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int which) {
+                    runInBackground("> выключаю иконку...", new Job() {
+                        @Override
+                        public void run(Keeper.Progress p) {
+                            Keeper.runIcon(MainActivity.this, "stop", p);
+                        }
+                    });
+                }
+            });
+        } else {
+            b.setPositiveButton("Включить", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int which) {
+                    runInBackground("> включаю иконку...", new Job() {
+                        @Override
+                        public void run(Keeper.Progress p) {
+                            Keeper.runIcon(MainActivity.this, "start", p);
+                        }
+                    });
+                }
+            });
+        }
+        b.setNeutralButton("Что видит модем", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface d, int which) {
+                runInBackground("> опрашиваю модем...", new Job() {
+                    @Override
+                    public void run(Keeper.Progress p) {
+                        Keeper.runIcon(MainActivity.this, "signal", p);
+                    }
+                });
+            }
+        });
         b.show();
     }
 

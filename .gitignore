@@ -1,4 +1,5 @@
 app/build/
+tbox/build/
 app/keystore.jks
 *.idsig
 
@@ -8,6 +9,8 @@ app/assets/wwan-boot.sh
 app/assets/dial.sh
 app/assets/at.sh
 app/assets/format-sdcard.sh
+app/assets/tbox-icon.sh
+app/assets/tboxwire.jar
 app/assets/huawei-modeswitch
 app/assets/*.ko
 

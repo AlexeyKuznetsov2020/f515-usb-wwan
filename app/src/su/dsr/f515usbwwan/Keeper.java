@@ -19,6 +19,7 @@ public class Keeper {
     static final String UP = DIR + "/wwan-up.sh";
     static final String BOOT = DIR + "/wwan-boot.sh";
     static final String FORMAT = DIR + "/format-sdcard.sh";
+    static final String ICON = DIR + "/tbox-icon.sh";
     static final String ADB_HOST = "127.0.0.1";
     static final int ADB_PORT = 5555;
 
@@ -33,6 +34,8 @@ public class Keeper {
             {"dial.sh", "dial.sh", Boolean.TRUE},
             {"at.sh", "at.sh", Boolean.TRUE},
             {"format-sdcard.sh", "format-sdcard.sh", Boolean.TRUE},
+            {"tbox-icon.sh", "tbox-icon.sh", Boolean.TRUE},
+            {"tboxwire.jar", "tboxwire.jar", Boolean.FALSE},
             {"huawei-modeswitch", "huawei-modeswitch", Boolean.TRUE},
             {"usbserialmerged2.ko", "usbserialmerged2.ko", Boolean.FALSE},
             {"ppp_async.ko", "ppp_async.ko", Boolean.FALSE},
@@ -52,6 +55,11 @@ public class Keeper {
     /** wwan-boot.sh with the given arguments ("--status", "--reset", "--disable", "--stop"). */
     public static String runBoot(Context ctx, String args, Progress progress) {
         return exec(ctx, BOOT, args, progress);
+    }
+
+    /** tbox-icon.sh with the given arguments ("status", "start", "stop", "signal"). */
+    public static String runIcon(Context ctx, String args, Progress progress) {
+        return exec(ctx, ICON, args, progress);
     }
 
     /** format-sdcard.sh with the given arguments ("--list" or "--format=sdX"). */
