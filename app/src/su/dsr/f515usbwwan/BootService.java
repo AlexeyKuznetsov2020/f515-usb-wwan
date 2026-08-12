@@ -38,6 +38,11 @@ public class BootService extends Service {
      * одного признака "сейчас работает" мало - второй броадкаст запускал всю процедуру
      * заново, и на стенде после ребута оставалось два сторожа. Этот признак живёт до
      * конца жизни процесса, то есть до следующей загрузки.
+     *
+     * Взводится только по УСПЕШНОМУ заходу. Раньше вставал сразу на входе, и если первый
+     * заход не дотянулся до adbd, второй броадкаст отшивался как лишний — а он приходит
+     * на полминуты позже, когда adbd уже поднялся, и был бы ровно тем запасным шансом,
+     * которого не хватило 2026-08-12.
      */
     private static volatile boolean alreadyRan = false;
 
@@ -53,7 +58,6 @@ public class BootService extends Service {
                 return START_NOT_STICKY;
             }
             running = true;
-            alreadyRan = true;
         }
 
         new Thread(new Runnable() {
@@ -71,9 +75,11 @@ public class BootService extends Service {
                                     Log.w(TAG, "boot: " + line);
                                 }
                             });
+                    alreadyRan = true;
                     Log.w(TAG, "boot: готово\n" + out);
                 } catch (Throwable t) {
-                    Log.e(TAG, "boot: сорвалось", t);
+                    // Признак не взводим: пусть следующий броадкаст попробует ещё раз.
+                    Log.e(TAG, "boot: сорвалось, следующий броадкаст попробует снова", t);
                 } finally {
                     running = false;
                     stopForeground(true);

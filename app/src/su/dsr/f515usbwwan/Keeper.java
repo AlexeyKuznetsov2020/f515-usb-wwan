@@ -112,8 +112,14 @@ public class Keeper {
     /**
      * The autostart path (BootService): same as startAutostart, but waits for adbd to
      * come up first - right after a reboot it usually is not listening yet.
+     *
+     * Ошибку НЕ глотает, а пробрасывает: вызывающий по ней решает, считать ли заход
+     * состоявшимся. Раньше неудача возвращалась обычной строкой, неотличимой от успеха,
+     * и второй броадкаст (BOOT_COMPLETED следом за LOCKED_BOOT_COMPLETED) отшивался как
+     * лишний — хотя именно он и был запасным шансом.
      */
-    public static String bootAutostart(Context ctx, long budgetMs, Progress progress) {
+    public static String bootAutostart(Context ctx, long budgetMs, Progress progress)
+            throws Exception {
         synchronized (LOCK) {
             StringBuilder sb = new StringBuilder();
             AdbClient adb = null;
@@ -142,6 +148,7 @@ public class Keeper {
                 line(progress, sb, "запуск wwan-boot.sh: " + out.trim());
             } catch (Exception e) {
                 line(progress, sb, "автозапуск не состоялся: " + e);
+                throw e;
             } finally {
                 if (adb != null) adb.close();
             }
@@ -191,10 +198,17 @@ public class Keeper {
      * Waits with a growing delay instead of hammering, and gives up rather than looping
      * forever - if adb never shows up, nothing here can work anyway and the user still has
      * the buttons.
+     *
+     * Отсчёт идёт по elapsedRealtime, а НЕ по currentTimeMillis. Голова стартует с часами
+     * 1970 года и подтягивает реальное время через несколько секунд после загрузки —
+     * ровно тогда, когда мы тут и крутимся. По стенным часам дедлайн в этот момент
+     * уезжает на 56 лет в прошлое, цикл выходит после первой же попытки, и автозапуск
+     * молча не состаивается (наблюдалось 2026-08-12: «попытка 1» в 03:00:14 по старым
+     * часам, следом сразу «не состоялся» в 13:29:48 по новым).
      */
     static AdbClient connectWaiting(Context ctx, long budgetMs, Progress progress) throws Exception {
         Exception last = null;
-        long deadline = System.currentTimeMillis() + budgetMs;
+        long deadline = android.os.SystemClock.elapsedRealtime() + budgetMs;
         for (int i = 1; ; i++) {
             try {
                 AdbClient adb = connect(ctx, RUN_TIMEOUT_MS);
@@ -207,7 +221,7 @@ public class Keeper {
                 if (progress != null && i % 10 == 1) {
                     progress.onLine("adbd пока недоступен (попытка " + i + "): " + e);
                 }
-                if (System.currentTimeMillis() >= deadline) break;
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) break;
                 Thread.sleep(ADB_POLL_MS);
             }
         }
