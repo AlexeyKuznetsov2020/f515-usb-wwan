@@ -27,6 +27,16 @@ public class Keeper {
      *  registration (30s) + dial timeout (60s) + margin. */
     private static final int RUN_TIMEOUT_MS = 180000;
 
+    /**
+     * Как часто дёргать adbd, пока он не поднялся после перезагрузки.
+     *
+     * Была лесенка 5→10→…→30 с, и она регулярно проедала полминуты на пустом месте: adbd
+     * поднимался, скажем, на 35-й секунде, а следующая попытка приходилась на 45-ю. Попытка
+     * стоит одного connect() на localhost, так что секундный опрос ничего не стоит, зато
+     * автозапуск начинается ровно тогда, когда становится возможен.
+     */
+    private static final int ADB_POLL_MS = 1000;
+
     /** name in assets/, path on device, executable bit */
     private static final Object[][] FILES = {
             {"wwan-up.sh", "wwan-up.sh", Boolean.TRUE},
@@ -103,12 +113,12 @@ public class Keeper {
      * The autostart path (BootService): same as startAutostart, but waits for adbd to
      * come up first - right after a reboot it usually is not listening yet.
      */
-    public static String bootAutostart(Context ctx, int attempts, Progress progress) {
+    public static String bootAutostart(Context ctx, long budgetMs, Progress progress) {
         synchronized (LOCK) {
             StringBuilder sb = new StringBuilder();
             AdbClient adb = null;
             try {
-                adb = connectWaiting(ctx, attempts, progress);
+                adb = connectWaiting(ctx, budgetMs, progress);
                 String uid = adb.shell("id -u").trim();
                 line(progress, sb, "adb connected, uid=" + uid);
                 if (!uid.startsWith("0")) {
@@ -182,21 +192,23 @@ public class Keeper {
      * forever - if adb never shows up, nothing here can work anyway and the user still has
      * the buttons.
      */
-    static AdbClient connectWaiting(Context ctx, int attempts, Progress progress) throws Exception {
+    static AdbClient connectWaiting(Context ctx, long budgetMs, Progress progress) throws Exception {
         Exception last = null;
-        int delayMs = 5000;
-        for (int i = 1; i <= attempts; i++) {
+        long deadline = System.currentTimeMillis() + budgetMs;
+        for (int i = 1; ; i++) {
             try {
                 AdbClient adb = connect(ctx, RUN_TIMEOUT_MS);
                 if (progress != null) progress.onLine("adbd доступен с попытки " + i);
                 return adb;
             } catch (Exception e) {
                 last = e;
-                if (progress != null) {
-                    progress.onLine("adbd пока недоступен (попытка " + i + "/" + attempts + "): " + e);
+                // Раз в 10 попыток, а не каждый раз: попытки теперь секундные, и полный
+                // список забивал бы логи одинаковыми ECONNREFUSED.
+                if (progress != null && i % 10 == 1) {
+                    progress.onLine("adbd пока недоступен (попытка " + i + "): " + e);
                 }
-                Thread.sleep(delayMs);
-                if (delayMs < 30000) delayMs += 5000;
+                if (System.currentTimeMillis() >= deadline) break;
+                Thread.sleep(ADB_POLL_MS);
             }
         }
         throw last != null ? last : new java.io.IOException("adbd недоступен");

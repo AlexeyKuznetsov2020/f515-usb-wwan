@@ -28,8 +28,8 @@ public class BootService extends Service {
     private static final String TAG = "f515usbwwan";
     private static final String CHANNEL = "wwan-boot";
     private static final int NOTIFICATION_ID = 1;
-    /** ~20 попыток с паузой 5..30 с - примерно 8 минут ожидания adbd, дальше сдаёмся. */
-    private static final int ADB_ATTEMPTS = 20;
+    /** Сколько всего ждать adbd (опрашивая раз в секунду), прежде чем сдаться. */
+    private static final long ADB_BUDGET_MS = 8 * 60 * 1000;
 
     private static volatile boolean running = false;
     /**
@@ -64,7 +64,7 @@ public class BootService extends Service {
                         Log.w(TAG, "boot: автозапуск выключен, выхожу");
                         return;
                     }
-                    String out = Keeper.bootAutostart(BootService.this, ADB_ATTEMPTS,
+                    String out = Keeper.bootAutostart(BootService.this, ADB_BUDGET_MS,
                             new Keeper.Progress() {
                                 @Override
                                 public void onLine(String line) {

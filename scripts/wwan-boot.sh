@@ -43,8 +43,21 @@ PIDFILE=$STATE/watchdog.pid
 RESTARTS=$STATE/restarts
 
 MAX_ATTEMPTS=${WWAN_MAX_ATTEMPTS:-3}
-BOOT_DELAY=${WWAN_BOOT_DELAY:-45}
+# Пауза перед первым заходом. Была 45 с «на всякий случай», но ждать тут нечего:
+# приложение и так стартует нас только после того, как дождалось adbd, а всё
+# остальное (модуль, порты, регистрация) wwan-up.sh проверяет сам и с ретраями.
+# Пять секунд оставлены как фора планировщику: сразу после BOOT_COMPLETED голова
+# занята собой, и торопиться в эту секунду смысла нет.
+BOOT_DELAY=${WWAN_BOOT_DELAY:-5}
 WATCH_INTERVAL=${WWAN_WATCH_INTERVAL:-60}
+# Сколько раз подряд пробовать поднять модем внутри ОДНОГО захода и с какой паузой.
+# Первый заход после перезагрузки часто падает не потому, что что-то сломано, а
+# потому, что модем только что перещёлкнули modeswitch'ем: порты уже есть, а AT в
+# них ещё не отвечает. Раньше это стоило минуты простоя — заход сдавался, и связь
+# появлялась только со следующей проверкой watchdog'а. Ретраи живут внутри bring_up
+# и в счётчик перезапусков за час не идут: голова между ними не перезагружается.
+BRINGUP_RETRIES=${WWAN_BRINGUP_RETRIES:-3}
+BRINGUP_RETRY_DELAY=${WWAN_BRINGUP_RETRY_DELAY:-5}
 # Больше стольких перезапусков за час — считаем, что чиним не то, и уходим спать
 # надолго, чтобы не долбить модем и не жечь трафик впустую.
 MAX_RESTARTS_PER_HOUR=${WWAN_MAX_RESTARTS:-4}
@@ -189,20 +202,27 @@ bring_up() {
 	_a=$(read_num "$ATTEMPTS")
 	echo $((_a + 1)) >"$ATTEMPTS"
 	sync
-	log "--- wwan-up.sh --system --boot (заход $((_a + 1))) ---"
-	sh "$UP" --system --boot >>"$LOG" 2>&1
-	_rc=$?
-	# Управление вернулось — значит голова пережила заход, что бы там ни было
-	# с модемом. Именно это и обнуляет счётчик (см. шапку файла).
-	echo 0 >"$ATTEMPTS"
-	sync
-	_if=$(wan_iface)
-	_ad=$([ -n "$_if" ] && iface_addr "$_if")
-	if [ -n "$_ad" ]; then
-		date '+%F %T' >"$LAST_OK"
-		log "подъём ок: $_if $_ad (rc=$_rc)"
-		return 0
-	fi
+	_try=1
+	while :; do
+		log "--- wwan-up.sh --system --boot (заход $((_a + 1)), попытка $_try/$BRINGUP_RETRIES) ---"
+		sh "$UP" --system --boot >>"$LOG" 2>&1
+		_rc=$?
+		# Управление вернулось — значит голова пережила заход, что бы там ни было
+		# с модемом. Именно это и обнуляет счётчик (см. шапку файла).
+		echo 0 >"$ATTEMPTS"
+		sync
+		_if=$(wan_iface)
+		_ad=$([ -n "$_if" ] && iface_addr "$_if")
+		if [ -n "$_ad" ]; then
+			date '+%F %T' >"$LAST_OK"
+			log "подъём ок: $_if $_ad (rc=$_rc)"
+			return 0
+		fi
+		[ "$_try" -ge "$BRINGUP_RETRIES" ] && break
+		log "попытка $_try не удалась (rc=$_rc) — повтор через $BRINGUP_RETRY_DELAY с"
+		sleep "$BRINGUP_RETRY_DELAY"
+		_try=$((_try + 1))
+	done
 	log "подъём не удался (rc=$_rc), подробности выше и в wwan.log"
 	return 1
 }
