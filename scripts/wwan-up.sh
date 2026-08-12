@@ -21,6 +21,8 @@
 #   wwan-up.sh --boot       режим автозапуска: вокруг insmod ставится маркер, по
 #                           которому wwan-boot.sh после ребута понимает, что голова
 #                           упала именно на загрузке модуля (см. docs/autostart.md)
+#   wwan-up.sh --wifi-prio  только пересчитать приоритет Wi-Fi над модемом в main
+#                           и выйти; молчит, если менять нечего (зовёт watchdog)
 #
 # Настройки: переменные окружения или /data/local/tmp/wwan.conf (см. wwan.conf.example).
 
@@ -31,6 +33,9 @@ PPP_LOG=$TMP/ppp.log
 CONF=${WWAN_CONF:-$TMP/wwan.conf}
 STATE=${WWAN_STATE:-$DIR/state}
 INFLIGHT=$STATE/insmod-inflight
+# Счётчик подряд неудачных проверок интернета в Wi-Fi: живёт между запусками,
+# потому что проверку дёргает watchdog отдельным процессом раз в несколько секунд.
+WIFI_FAILS=$STATE/wifi-fails
 
 [ -f "$CONF" ] && . "$CONF"
 
@@ -49,17 +54,27 @@ AT_WAIT_SECS=${WWAN_AT_WAIT_SECS:-20}
 # Запасные значения для hilink-ветки, если DHCP почему-то ничего не отдал.
 HILINK_ADDR=${WWAN_HILINK_ADDR:-192.168.0.178}
 HILINK_GW=${WWAN_HILINK_GW:-192.168.0.1}
+# Метрика default'а Wi-Fi в main. Должна быть ЛУЧШЕ (меньше) модемной двадцатки:
+# модем — резерв, а не основной канал. Ноль не берём, чтобы отличать наш маршрут
+# от чужих.
+WIFI_METRIC=${WWAN_WIFI_METRIC:-10}
+# Сколько проверок подряд должны не пройти, чтобы отобрать у Wi-Fi приоритет.
+# Одна — слишком нервно: потерянный пакет или моргнувшая точка доступа не повод
+# уводить трафик на мобильный.
+WIFI_MAX_FAILS=${WWAN_WIFI_MAX_FAILS:-2}
 
 CHECK_ONLY=0
 DO_SYSTEM=0
 DO_DOWN=0
 BOOT_MODE=0
+DO_WIFI_PRIO=0
 for a in "$@"; do
 	case "$a" in
 	-c | --check)  CHECK_ONLY=1 ;;
 	-s | --system) DO_SYSTEM=1 ;;
 	--down)        DO_DOWN=1 ;;
 	--boot)        BOOT_MODE=1 ;;
+	--wifi-prio)   DO_WIFI_PRIO=1 ;;
 	-h | --help)   sed -n '2,30p' "$0"; exit 0 ;;
 	*) echo "неизвестный аргумент: $a (см. --help)"; exit 64 ;;
 	esac
@@ -189,6 +204,111 @@ mod_dir() {
 	_d=${WWAN_MODDIR:-$DIR}
 	[ -f "$_d/$1" ] || _d=$TMP
 	echo "$_d"
+}
+
+# ------------------------------------------------------- приоритет Wi-Fi ----
+# Модем — резерв, а не основной канал: пока в Wi-Fi есть интернет, ходить надо
+# через него.
+#
+# У приложений Android это и так работает само: ConnectivityService предпочитает
+# валидированный Wi-Fi сотовой сети и переключает их на модем, как только Wi-Fi
+# перестаёт быть валидированным. Чинить нужно трафик БЕЗ метки — системные
+# демоны, root-шелл, adb-команды: он идёт по main, а там до сих пор был только
+# модемный default.
+#
+# Кладём в main default через Wi-Fi с метрикой лучше модемной. Именно метрику, а
+# не удаление модемного маршрута: когда wlan0 гаснет, ядро само выносит все его
+# маршруты, и модем остаётся единственным default'ом — без чьего-либо участия и
+# без гонки.
+#
+# Отсюда три правила, по которым эта стадия и живёт:
+#   1. Wi-Fi приоритетнее модема ПО УМОЛЧАНИЮ — как только у него есть адрес и
+#      шлюз, маршрут кладётся, ничего не спрашивая;
+#   2. приоритет снижается ТОЛЬКО при доказанном «подключён, но интернета нет»
+#      (см. wifi_no_internet) и только если есть куда падать — модемный default;
+#   3. выключенный Wi-Fi — не наше дело: интерфейса нет, функция молча выходит,
+#      маршруты уже снял кто надо. Ничего «на всякий случай» не сносим.
+
+wifi_iface() {
+	for _wi_d in /sys/class/net/wlan*; do
+		[ -e "$_wi_d/address" ] || continue
+		_wi_n=$(basename "$_wi_d")
+		[ -n "$(iface_addr "$_wi_n")" ] || continue
+		echo "$_wi_n"
+		return 0
+	done
+	return 1
+}
+
+# Шлюз Wi-Fi берём из ЕГО таблицы (Android держит маршруты сетей в отдельных
+# таблицах по имени интерфейса), в main его нет и не будет.
+wifi_gw() {
+	ip route show table "$1" 2>/dev/null |
+		sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1
+}
+
+# Есть ли интернет ИМЕННО через Wi-Fi. Спрашиваем сеть сами, двумя независимыми
+# способами, и хватает одного удачного:
+#   - HTTP-проба на 204 — тот же адрес, которым проверяет сети сам Android;
+#     проходит там, где режут ICMP;
+#   - пинг — на случай, если HTTP-пробу перехватывает или блокирует провайдер.
+# Обе привязаны к интерфейсу (--interface / -I), иначе они уйдут туда, куда
+# смотрит main, и будут мерить не Wi-Fi, а модем.
+#
+# Вердикт самого Android (lastValidated) сознательно НЕ используется: он
+# остаётся true минутами после реальной пропажи интернета — проверено на стенде,
+# три минуты без единого пакета наружу, а флаг не шелохнулся. Для «приоритет
+# по умолчанию у Wi-Fi» это неважно, а вот понижать по устаревшему флагу нельзя.
+wifi_online() {
+	if have curl; then
+		[ "$(curl -s -m 5 --interface "$1" -o /dev/null -w '%{http_code}' \
+			http://connectivitycheck.gstatic.com/generate_204 2>/dev/null)" = "204" ] &&
+			return 0
+	fi
+	ping -c 1 -W 3 -I "$1" 8.8.8.8 >/dev/null 2>&1
+}
+
+# Печатает строку и возвращает 0, ТОЛЬКО если что-то изменил: функцию дёргает
+# watchdog раз в минуту, и молчание — нормальное состояние.
+wifi_priority() {
+	_wp_if=$(wifi_iface) || return 1
+	_wp_gw=$(wifi_gw "$_wp_if")
+	[ -n "$_wp_gw" ] || return 1
+	_wp_have=$(ip route show table main 2>/dev/null |
+		grep "^default via $_wp_gw dev $_wp_if ")
+
+	if ! wifi_online "$_wp_if"; then
+		# Одна неудачная проба — ещё не приговор: пакет теряется, точка доступа
+		# моргает. Понижаем после WIFI_MAX_FAILS подряд.
+		_wp_n=$(($(cat "$WIFI_FAILS" 2>/dev/null || echo 0) + 1))
+		echo "$_wp_n" >"$WIFI_FAILS" 2>/dev/null
+		[ "$_wp_n" -lt "$WIFI_MAX_FAILS" ] && return 1
+		[ -z "$_wp_have" ] && return 1
+		# Падать есть куда только при живом модемном default'е. Иначе оставляем
+		# Wi-Fi как есть: плохой интернет лучше никакого, а пустой main — это
+		# отсутствие связи вообще, в том числе для управляющего adb.
+		_wp_fallback=$(ip route show table main 2>/dev/null |
+			grep '^default' | grep -v "dev $_wp_if ")
+		[ -z "$_wp_fallback" ] && return 1
+		if [ "$CHECK_ONLY" = 1 ]; then
+			echo "в Wi-Fi $_wp_if нет интернета ($_wp_n проверки подряд) — приоритет вернулся бы модему"
+			return 0
+		fi
+		ip route del default via "$_wp_gw" dev "$_wp_if" table main \
+			metric "$WIFI_METRIC" 2>/dev/null || return 1
+		echo "в Wi-Fi $_wp_if нет интернета ($_wp_n проверки подряд) — приоритет вернулся модему"
+	else
+		echo 0 >"$WIFI_FAILS" 2>/dev/null
+		[ -n "$_wp_have" ] && return 1
+		if [ "$CHECK_ONLY" = 1 ]; then
+			echo "Wi-Fi $_wp_if ($_wp_gw) стал бы приоритетнее модема в main"
+			return 0
+		fi
+		ip route replace default via "$_wp_gw" dev "$_wp_if" table main \
+			metric "$WIFI_METRIC" 2>/dev/null || return 1
+		echo "Wi-Fi $_wp_if ($_wp_gw) приоритетнее модема в main (metric $WIFI_METRIC)"
+	fi
+	return 0
 }
 
 # Каталог модема в sysfs + его VID/PID (Huawei-семейство).
@@ -381,6 +501,13 @@ add_default() {
 }
 
 # ------------------------------------------------------------------- --down --
+# Отдельный короткий режим для watchdog'а: ни логов, ни стадий, ни шапки —
+# только пересчёт приоритета. Печатает строку, если что-то поменял.
+if [ "$DO_WIFI_PRIO" = 1 ]; then
+	wifi_priority
+	exit 0
+fi
+
 if [ "$DO_DOWN" = 1 ]; then
 	stage "остановка"
 	_pids=$(pidof pppd 2>/dev/null)
@@ -928,6 +1055,17 @@ if [ "$DO_SYSTEM" = 1 ]; then
 		warn "в main уже есть чужой default: $_cur"
 		warn "не трогаю — убери его вручную, если нужен модем" ;;
 	esac
+
+	# ...но модем в main — резерв: пока в Wi-Fi есть интернет, он должен быть
+	# приоритетнее (см. wifi_priority выше). Дальше за этим следит watchdog.
+	_wp=$(wifi_priority) && ok "$_wp" || {
+		_wp_if=$(wifi_iface) || _wp_if=""
+		if [ -z "$_wp_if" ]; then
+			skip "Wi-Fi не поднят — в main остаётся только модем"
+		else
+			skip "приоритет Wi-Fi над модемом уже расставлен"
+		fi
+	}
 
 	# У приложений маршрутизация другая: ConnectivityService помечает их сокеты
 	# fwmark'ом конкретной сети (netd, per-app default network) и заворачивает
