@@ -246,20 +246,34 @@ public class MainActivity extends Activity {
 
     private void showIconDialog(String status) {
         final boolean running = value(status, "running").equals("1");
+        // На части машин сотовой иконки в панели нет вообще (в конфигурации не заявлен
+        // TBOX), и тогда эмуляция работает вхолостую: цифры до головы доезжают, но рисовать
+        // их некому. Про такую голову честнее сказать прямо, чем показывать "работает"
+        // рядом с пустым местом в статус-баре.
+        final boolean capable = !value(status, "capable").equals("0");
 
         StringBuilder msg = new StringBuilder();
         msg.append("Штатная иконка мобильной сети показывает сигнал USB-модема ")
                 .append("вместо крестика: голове отдаётся то, что в машине отдавал бы блок TBOX.\n\n");
-        msg.append("Сейчас: ").append(running ? "работает" : "не запущена").append('\n');
-        msg.append("После подъёма модема: ").append(value(status, "enabled").equals("1")
-                ? "включается сама" : "не включается (выключено вручную)").append('\n');
+        if (!capable) {
+            msg.append("На этой голове иконки нет: ").append(value(status, "capable_why"))
+                    .append(".\nПанель не создаёт её вообще — не крестик, а пустое место, ")
+                    .append("поэтому эмуляция не запускается и модем не опрашивается.\n");
+        } else {
+            msg.append("Сейчас: ").append(running ? "работает" : "не запущена").append('\n');
+            msg.append("После подъёма модема: ").append(value(status, "enabled").equals("1")
+                    ? "включается сама" : "не включается (выключено вручную)").append('\n');
+        }
         msg.append("\nНа сам интернет это никак не влияет — только на картинку в статус-баре.");
 
         AlertDialog.Builder b = new AlertDialog.Builder(this)
                 .setTitle("Иконка сотовой сети")
                 .setMessage(msg.toString());
 
-        if (running) {
+        if (!capable) {
+            // Кнопки "Включить" нет намеренно: включать нечего. Опрос модема оставляем —
+            // он полезен сам по себе, независимо от панели.
+        } else if (running) {
             b.setNegativeButton("Выключить", new DialogInterface.OnClickListener() {
                 @Override
                 public void onClick(DialogInterface d, int which) {

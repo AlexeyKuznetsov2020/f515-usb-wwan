@@ -7,6 +7,7 @@
 #   tbox-icon.sh status                       работает или нет + последние строки лога
 #   tbox-icon.sh signal                       разовый опрос модема, ничего не запуская
 #   tbox-icon.sh fake N                       показать фиксированные N палок (проверка)
+#   tbox-icon.sh capable                      умеет ли эта голова показать иконку вообще
 #
 # Выключатель — файл state/icon со словом on/off внутри (а не «есть файл/нет файла»:
 # в этом проекте запрещено удалять что-либо, а выключатель должен сниматься). Пока там
@@ -35,10 +36,86 @@ IFACE=${TBOX_IFACE:-vlan62}
 LOG=$STATE/tbox.log
 PIDFILE=$STATE/tbox.pid
 SWITCH=$STATE/icon
+CAP_CACHE=$STATE/icon-capable
 
 mkdir -p "$STATE" 2>/dev/null
 
 enabled() { [ "$(cat "$SWITCH" 2>/dev/null)" != off ]; }
+
+# --- умеет ли эта голова показать штатную иконку вообще ----------------------
+#
+# Не на всякой машине сотовая иконка в панели есть. SystemUI заводит её, только если
+# внутренний ключ ID_CELLULAR_ENABLE равен 1, иначе не подписывается на ID_CELLULAR_*
+# и не создаёт вью — в панели не крестик, а пустое место. Наши цифры при этом доезжают
+# до com.tbox.service целыми (видно в logcat), но слушателей у события ноль.
+#
+# Проверено 2026-08-12 на голове с 3G-модемом: прошивка панели там байт в байт наша,
+# отличается ровно один ключ конфигурации машины. Разбор — recon/colleague-head/README.md.
+#
+# Спрашиваем саму голову, а не гадаем: провайдер publicadapter отдаёт ID_CELLULAR_ENABLE
+# либо числом, либо JS-выражением над проперти машины (их считает Rhino в PersistenceUtil).
+# Число — верим как есть; выражение — считаем сами по пропертям.
+CAPABLE_WHY=
+CAPABLE_SURE=1
+
+cell_enable_expr() {
+	timeout 10 content query --uri content://com.seres.publicadapter.provider/config_inner 2>/dev/null |
+		sed -n 's/.*"ID_CELLULAR_ENABLE"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' |
+		tr -d '"' | head -1
+}
+
+# 0 — иконка возможна, 1 — нет. Человеческая причина остаётся в $CAPABLE_WHY.
+capable_probe() {
+	CAPABLE_SURE=1
+	_expr=$(cell_enable_expr)
+	case "$_expr" in
+	1) CAPABLE_WHY="ID_CELLULAR_ENABLE=1"; return 0 ;;
+	0) CAPABLE_WHY="ID_CELLULAR_ENABLE=0 — панель не создаёт сотовую иконку"; return 1 ;;
+	esac
+
+	_tbox=$(getprop seres.platform.config.tbox 2>/dev/null)
+	_region=$(getprop persist.seres.platform.config.region.code 2>/dev/null)
+	# Пусто — значит прошивка устроена иначе, чем мы знаем. Тогда не мешаем работать:
+	# выключить иконку там, где она работала, хуже, чем зря погонять эмуляцию.
+	if [ -z "$_tbox" ]; then
+		# Не кешируем: на раннем старте провайдер и vehicle-HAL могут быть ещё не готовы,
+		# и залипнуть на догадке до конца загрузки было бы хуже, чем спросить ещё раз.
+		CAPABLE_SURE=0
+		CAPABLE_WHY="конфиг машины не прочитался — считаем, что иконка есть"
+		return 0
+	fi
+	if [ "$_tbox" != 1 ]; then
+		CAPABLE_WHY="в машине не заявлен TBOX (config tbox=$_tbox) — иконки в панели нет"
+		return 1
+	fi
+	if [ "$_region" = 4 ]; then
+		CAPABLE_WHY="регион $_region — сотовая иконка выключена прошивкой"
+		return 1
+	fi
+	CAPABLE_WHY="config tbox=1, регион ${_region:-неизвестен}"
+	return 0
+}
+
+# Кеш привязан к boot_id: проперти машины выставляет vehicle-HAL при загрузке и внутри
+# одной загрузки они не меняются, а state/ переживает перезагрузку — без привязки кеш
+# протух бы незаметно.
+capable() {
+	if [ "${TBOX_ICON_FORCE:-0}" = 1 ]; then
+		CAPABLE_WHY="принудительно (TBOX_ICON_FORCE=1)"
+		return 0
+	fi
+	_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+	_c=$(cat "$CAP_CACHE" 2>/dev/null)
+	if [ -n "$_boot" ] && [ "${_c%% *}" = "$_boot" ]; then
+		_rest=${_c#* }
+		CAPABLE_WHY=${_rest#* }
+		[ "${_rest%% *}" = 1 ]
+		return $?
+	fi
+	if capable_probe; then _v=1; else _v=0; fi
+	[ "$CAPABLE_SURE" = 1 ] && echo "$_boot $_v $CAPABLE_WHY" >"$CAP_CACHE" 2>/dev/null
+	[ "$_v" = 1 ]
+}
 
 running_pid() {
 	# pidof надёжнее pidfile: имя процесса задаёт --nice-name, и переживает оно всё.
@@ -75,6 +152,12 @@ start)
 	need_jar
 	PID=$(running_pid)
 	[ -n "$PID" ] && { echo "уже работает, pid $PID (остановить: $0 stop)"; exit 0; }
+	capable || {
+		echo "$CAPABLE_WHY" >&2
+		echo "эмуляция TBOX здесь ничего не покажет — панель не создаёт сотовую иконку." >&2
+		echo "если всё равно надо: TBOX_ICON_FORCE=1 $0 start" >&2
+		exit 3
+	}
 	add_alias
 	# setsid + закрытый stdin: процесс должен пережить обрыв adb-сессии, из которой
 	# его запустили. Именно так приложение стартует и wwan-boot.sh.
@@ -102,6 +185,9 @@ auto)
 	# Вызывается из wwan-up.sh и из watchdog'а wwan-boot.sh, поэтому молчаливая и
 	# ничего не ломает: выключено — вышли, уже работает — вышли.
 	enabled || { echo "иконка выключена (state/icon=off)"; exit 0; }
+	# Не просто «нечего показывать»: на такой голове поллер каждые 5 с дёргал бы AT-порт
+	# модема впустую и конкурировал за него с wwan-up.sh.
+	capable || { echo "иконка: $CAPABLE_WHY — эмуляцию TBOX не запускаем"; exit 0; }
 	[ -f "$JAR" ] || { echo "иконка: нет $JAR, пропускаем"; exit 0; }
 	[ -n "$(running_pid)" ] && exit 0
 	sh "$0" start >/dev/null 2>&1 || echo "иконка: запустить не вышло, см. $LOG"
@@ -132,6 +218,8 @@ status)
 	fi
 	echo "running=$([ -n "$PID" ] && echo 1 || echo 0)"
 	echo "enabled=$(enabled && echo 1 || echo 0)"
+	if capable; then echo "capable=1"; else echo "capable=0"; fi
+	echo "capable_why=$CAPABLE_WHY"
 	echo "алиас:    $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | grep " $SRC_IP/" |
 		sed 's/  */ /g' || echo "нет $SRC_IP на $IFACE")"
 	echo "WAN:      $(cat "$STATE/wan-iface" 2>/dev/null || echo "неизвестен (модем не поднимали)")"
@@ -160,8 +248,17 @@ fake)
 	java_run --strength "$N"
 	;;
 
+capable)
+	if capable; then
+		echo "штатная иконка возможна: $CAPABLE_WHY"
+	else
+		echo "штатной иконки на этой голове нет: $CAPABLE_WHY"
+		exit 1
+	fi
+	;;
+
 -h | --help | help)
-	sed -n '2,12p' "$0"
+	sed -n '2,13p' "$0"
 	;;
 
 *)
