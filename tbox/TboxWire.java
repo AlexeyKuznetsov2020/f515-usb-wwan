@@ -115,8 +115,8 @@ public final class TboxWire {
     static int notifyMs = 5000;
     // Фазы уведомлений. IDLE — обычный режим, шлём то, что намерил модем; остальные две
     // рисуют анимацию вместо заглушки, каждая со своим тактом. Опрос модема от этого чаще
-    // не становится: readSignal() кеширует его на MODEM_POLL_MS, анимация подменяет только
-    // то, что уходит на провод.
+    // не становится: он живёт в своём потоке со своим периодом MODEM_POLL_MS, а нотификатор
+    // только читает последнее значение и подменяет то, что уходит на провод.
     static final int PHASE_IDLE = 0;
     /** Приложение дождалось adbd и проверяет файлы: крестик ↔ полная шкала раз в секунду. */
     static final int PHASE_APPCHECK = 1;
@@ -202,6 +202,8 @@ public final class TboxWire {
 
         if (!probeOnly) {
             startTcpServer(src, tcpPort);
+            // Опрос модема — раньше нотификатора: к первому такту уже есть что отправить.
+            startPoller();
             startNotifier();
         }
 
@@ -414,10 +416,18 @@ public final class TboxWire {
                     for (Socket s : snapshot) {
                         try {
                             OutputStream os = s.getOutputStream();
+                            // Запись в сокет — единственное, что в этом такте ещё способно
+                            // заблокироваться (буфер отправки полон, а SystemUI не читает).
+                            // Измеряем: 2026-08-12 такт встал на 4 минуты 40 секунд, и по
+                            // логу нельзя было отличить залипание здесь от залипания в
+                            // опросе модема — строка пишется уже после flush.
+                            long t0 = System.nanoTime();
                             os.write(msg);
                             os.flush();
+                            long took = (System.nanoTime() - t0) / 1000000L;
                             say(">> #" + n + " reg=" + sig.reg + " strength=" + sig.strength
-                                    + " (" + sig.detail + ") -> " + s.getRemoteSocketAddress());
+                                    + " (" + sig.detail + ") -> " + s.getRemoteSocketAddress()
+                                    + (took >= SLOW_WRITE_WARN_MS ? "  [запись " + took + " мс]" : ""));
                         } catch (Exception e) {
                             say("отвалился " + s.getRemoteSocketAddress() + ": " + e);
                             synchronized (clients) { clients.remove(s); }
@@ -493,28 +503,70 @@ public final class TboxWire {
         }
     }
 
-    static long lastPollAt = 0;
-    static Sig cachedSignal = null;
+    static volatile Sig cachedSignal = null;
 
-    /** Результат кешируется на MODEM_POLL_MS: AT-сессия небесплатная. */
+    /**
+     * Мгновенный доступ к последнему намеренному значению. НИЧЕГО не блокирует.
+     *
+     * Опрос модема отсюда убран намеренно. Раньше он шёл прямо в такте нотификатора, и
+     * 2026-08-12 после выхода из сна одна итерация цикла заняла 4 минуты 40 секунд
+     * (уведомления #199 и #200 идут подряд по номерам, но с такой дырой по времени).
+     * Всё это время в SystemUI не уходило ни одного события, подписка живёт три секунды —
+     * и иконка сваливалась в крестик ровно тогда, когда анимация должна была показывать,
+     * что подъём идёт. Теперь блокирующая работа заперта в отдельном потоке, а такт
+     * нотификатора не может встать ни при каких обстоятельствах.
+     */
     static Sig readSignal() {
         if (fixedStrength != Integer.MIN_VALUE) {
             int reg = regOverride >= 0 ? regOverride
                     : (fixedStrength < 0 ? REG_NONE : REG_STATUS_REGISTERED);
             return new Sig(reg, fixedStrength, "--strength");
         }
-        long now = System.currentTimeMillis();
-        if (cachedSignal != null && now - lastPollAt < MODEM_POLL_MS) return cachedSignal;
-        lastPollAt = now;
-        Sig s;
-        try {
-            s = pollModem();
-        } catch (Throwable t) {
-            s = new Sig(REG_NONE, -1, "ошибка опроса: " + t);
-        }
-        if (regOverride >= 0) s = new Sig(regOverride, s.strength, s.detail + " [--reg]");
-        cachedSignal = s;
-        return cachedSignal;
+        Sig s = cachedSignal;
+        return s != null ? s : new Sig(REG_STATUS_NONE, -1, "модем ещё не опрашивали");
+    }
+
+    /** Сколько ждать опрос модема, прежде чем считать это ненормальным и записать в лог. */
+    static final int SLOW_POLL_WARN_MS = 5000;
+    /** То же для записи в сокет подписчика — там нормой являются единицы миллисекунд. */
+    static final int SLOW_WRITE_WARN_MS = 1000;
+
+    /**
+     * Единственное место, где происходит блокирующий разговор с модемом.
+     *
+     * Пока идёт подъём, в AT-порт не лезем вовсе: `wwan-up.sh` на стадии «SIM и регистрация
+     * в сети» разговаривает с тем же `/dev/ttyUSB1`, и до этой правки мы ходили туда
+     * одновременно с ним, без какой-либо координации (2026-08-12: подъём держал порт
+     * 16:18:18-16:18:24, а мы опрашивали его в 16:18:15 и в 16:18:30). Показывать в это
+     * время всё равно нечего — идёт анимация, измерение на провод не уходит.
+     */
+    static void startPoller() {
+        Thread t = new Thread(new Runnable() {
+            public void run() {
+                while (true) {
+                    if (bringUpStage() == null) {
+                        long t0 = System.nanoTime();
+                        Sig s;
+                        try {
+                            s = pollModem();
+                        } catch (Throwable e) {
+                            s = new Sig(REG_NONE, -1, "ошибка опроса: " + e);
+                        }
+                        if (regOverride >= 0) {
+                            s = new Sig(regOverride, s.strength, s.detail + " [--reg]");
+                        }
+                        cachedSignal = s;
+                        long took = (System.nanoTime() - t0) / 1000000L;
+                        if (took >= SLOW_POLL_WARN_MS) say("опрос модема занял " + took + " мс");
+                    }
+                    try {
+                        Thread.sleep(MODEM_POLL_MS);
+                    } catch (InterruptedException e) { return; }
+                }
+            }
+        }, "poll");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**
