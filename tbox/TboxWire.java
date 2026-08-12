@@ -46,7 +46,9 @@ import java.net.URL;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 public final class TboxWire {
 
@@ -149,6 +151,53 @@ public final class TboxWire {
         System.out.flush();
     }
 
+    // ------------------------------------------------------- сколько писать в лог
+    //
+    // Голова обновляет подписку каждые ~3 секунды (столько живёт ttl), и на каждое
+    // обновление раньше уходило по две строки. Это 400 строк в минуту и 29 МБ файла
+    // за несколько дней, из которых 97% — одно и то же. Полезного там ровно один бит:
+    // «процесс жив и голова с нами разговаривает».
+    //
+    // Поэтому: первая подписка на каждую eventgroup — целиком, дальше только счётчик
+    // раз в SUB_SUMMARY_MS. События наружу — только когда цифры изменились, плюс
+    // редкий маячок, чтобы по логу было видно, что мы живы. Всё необычное (чужой
+    // сервис, отвалившийся клиент, медленная запись) пишется как писалось: молчание
+    // должно означать «всё ровно», а не «мы перестали смотреть».
+    static final int SUB_SUMMARY_MS = 60000;
+    static final int NOTIFY_HEARTBEAT_MS = 600000;
+
+    static final Set<Integer> subSeen = new HashSet<Integer>();
+    static int subRenewals = 0;
+    static long lastSubSummaryNs = System.nanoTime();
+    static int lastLoggedReg = Integer.MIN_VALUE;
+    static int lastLoggedStrength = Integer.MIN_VALUE;
+    static long lastNotifyLogNs = 0;
+    static long lastIdleLogNs = 0;
+
+    /** Пишет сводку по обновлениям подписки не чаще раза в минуту. */
+    static void subSummary() {
+        long now = System.nanoTime();
+        if (now - lastSubSummaryNs < SUB_SUMMARY_MS * 1000000L) return;
+        if (subRenewals > 0) {
+            say("подписка обновлена " + subRenewals + " раз за "
+                    + ((now - lastSubSummaryNs) / 1000000000L) + " с");
+        }
+        subRenewals = 0;
+        lastSubSummaryNs = now;
+    }
+
+    /** Стоит ли писать строку про очередное отправленное событие. */
+    static boolean notifyWorthLogging(Sig sig, long tookMs) {
+        long now = System.nanoTime();
+        boolean changed = sig.reg != lastLoggedReg || sig.strength != lastLoggedStrength;
+        boolean heartbeat = now - lastNotifyLogNs >= NOTIFY_HEARTBEAT_MS * 1000000L;
+        if (!changed && !heartbeat && tookMs < SLOW_WRITE_WARN_MS) return false;
+        lastLoggedReg = sig.reg;
+        lastLoggedStrength = sig.strength;
+        lastNotifyLogNs = now;
+        return true;
+    }
+
     // ------------------------------------------------------------------------- main
 
     public static void main(String[] args) throws Exception {
@@ -244,13 +293,24 @@ public final class TboxWire {
             if (type == 0x06 || type == 0x07) {
                 int counter = d[off + 13] & 0x0f;
                 int eg = readShort(d, off + 14);
-                say("<< " + from + " " + name + " svc=0x" + Integer.toHexString(svc)
-                        + " inst=" + inst + " major=" + maj + " ttl=" + entryTtl
-                        + " eventgroup=0x" + Integer.toHexString(eg) + " counter=" + counter);
-                if (type == 0x06 && svc == SERVICE_ID) {
+                boolean ours = type == 0x06 && svc == SERVICE_ID;
+                // Рутинное обновление подписки на наш сервис в лог не идёт — только
+                // первое на каждую eventgroup и сводка раз в минуту (см. subSummary).
+                // Всё остальное, включая чужие сервисы, пишется как раньше.
+                boolean first = !ours || subSeen.add(Integer.valueOf(eg));
+                if (first) {
+                    say("<< " + from + " " + name + " svc=0x" + Integer.toHexString(svc)
+                            + " inst=" + inst + " major=" + maj + " ttl=" + entryTtl
+                            + " eventgroup=0x" + Integer.toHexString(eg) + " counter=" + counter);
+                }
+                if (ours) {
+                    subRenewals++;
                     // Подписка на наш сервис — то, ради чего всё и затевалось.
-                    say("*** ПОДПИСКА на 0x" + Integer.toHexString(svc) + " eventgroup 0x"
-                            + Integer.toHexString(eg) + " от " + from + " -> шлём Ack");
+                    if (first) {
+                        say("*** ПОДПИСКА на 0x" + Integer.toHexString(svc) + " eventgroup 0x"
+                                + Integer.toHexString(eg) + " от " + from + " -> шлём Ack");
+                    }
+                    subSummary();
                     try {
                         byte[] ack = buildSubscribeAck(svc, inst, maj, entryTtl, counter, eg);
                         sd.send(new DatagramPacket(ack, ack.length, p.getAddress(), SD_PORT));
@@ -413,7 +473,13 @@ public final class TboxWire {
                     List<Socket> snapshot;
                     synchronized (clients) { snapshot = new ArrayList<Socket>(clients); }
                     if (snapshot.isEmpty()) {
-                        if (n % 6 == 1) say("событий не шлём: подписчиков по TCP пока нет");
+                        // Раньше — раз в шесть тактов; при полусекундном такте в фазе
+                        // подключения это набегало быстрее, чем успевало пригодиться.
+                        long nowNs = System.nanoTime();
+                        if (nowNs - lastIdleLogNs >= NOTIFY_HEARTBEAT_MS * 1000000L) {
+                            lastIdleLogNs = nowNs;
+                            say("событий не шлём: подписчиков по TCP пока нет");
+                        }
                         continue;
                     }
                     for (Socket s : snapshot) {
@@ -428,9 +494,11 @@ public final class TboxWire {
                             os.write(msg);
                             os.flush();
                             long took = (System.nanoTime() - t0) / 1000000L;
-                            say(">> #" + n + " reg=" + sig.reg + " strength=" + sig.strength
-                                    + " (" + sig.detail + ") -> " + s.getRemoteSocketAddress()
-                                    + (took >= SLOW_WRITE_WARN_MS ? "  [запись " + took + " мс]" : ""));
+                            if (notifyWorthLogging(sig, took)) {
+                                say(">> #" + n + " reg=" + sig.reg + " strength=" + sig.strength
+                                        + " (" + sig.detail + ") -> " + s.getRemoteSocketAddress()
+                                        + (took >= SLOW_WRITE_WARN_MS ? "  [запись " + took + " мс]" : ""));
+                            }
                         } catch (Exception e) {
                             say("отвалился " + s.getRemoteSocketAddress() + ": " + e);
                             synchronized (clients) { clients.remove(s); }
