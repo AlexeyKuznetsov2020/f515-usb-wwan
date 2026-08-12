@@ -90,7 +90,9 @@ public final class TboxWire {
     // ------------------------------------------------------------------ источник сигнала
     // Состояние WAN пишет wwan-up.sh: state/wan-iface — имя поднятого интерфейса.
     static String wwanDir = "/data/local/tmp/wwan";
-    static final String[] FALLBACK_AT_TTYS = { "/dev/ttyUSB1", "/dev/ttyUSB2" };
+    // ttyUSB0 в конце: на старых свистках (E173) AT отвечает и он, но это же порт для
+    // pppd, и занимать его без нужды не стоит — пробуем только когда молчат остальные.
+    static final String[] FALLBACK_AT_TTYS = { "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB0" };
     static final int MODEM_POLL_MS = 15000;       // одна AT-сессия занимает ~3 с, чаще незачем
     static final int STRENGTH_WHEN_UNKNOWN = 3;   // линк есть, а цифр нет — рисуем середину
     static final int HTTP_TIMEOUT_MS = 3000;
@@ -663,8 +665,21 @@ public final class TboxWire {
         }
     }
 
-    /** Управляющий AT-порт: bInterfaceProtocol == 12, как port_for_proto 12 в wwan-up.sh. */
+    /**
+     * Управляющий AT-порт.
+     *
+     * Порядок: сначала то, что реально нашёл `wwan-up.sh` и положил в state/at-tty —
+     * он перебирает все ttyUSB и оставляет тот, что действительно ответил. Только если
+     * файла нет (иконку запустили раньше первого подъёма), гадаем сами: сперва
+     * bInterfaceProtocol == 12, потом запасной список. Гадание ненадёжно: старые свистки
+     * вроде E173 (12d1:1c05) держат 0xFF у всех интерфейсов, и протокола 12 у них нет.
+     */
     static String findAtTty() {
+        String known = readFirstLine(new java.io.File(wwanDir, "state/at-tty").getPath());
+        if (known != null) {
+            known = known.trim();
+            if (known.length() > 0 && new java.io.File(known).exists()) return known;
+        }
         java.io.File[] devs = new java.io.File("/sys/bus/usb/devices").listFiles();
         if (devs != null) {
             for (java.io.File dev : devs) {
@@ -681,10 +696,18 @@ public final class TboxWire {
                 }
             }
         }
+        // Запасной список перебираем не «какой существует», а «какой отвечает»: порт
+        // может быть на месте и при этом молчать — ровно так ведёт себя ttyUSB1 у E173.
+        String firstPresent = null;
         for (String cand : FALLBACK_AT_TTYS) {
-            if (new java.io.File(cand).exists()) return cand;
+            if (!new java.io.File(cand).exists()) continue;
+            if (firstPresent == null) firstPresent = cand;
+            String r = at(cand, "AT");
+            if (r != null && r.toUpperCase(java.util.Locale.US).indexOf("OK") >= 0) return cand;
         }
-        return null;
+        // Никто не ответил — отдаём хоть что-то существующее, чтобы вызывающий доложил
+        // «порт не отвечает» с конкретным именем, а не молчаливым null.
+        return firstPresent;
     }
 
     /** AT-обмен через wwan/at.sh — там уже решены грабли с ctty и SIGTTIN. */

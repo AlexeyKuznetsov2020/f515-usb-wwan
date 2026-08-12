@@ -40,10 +40,11 @@ DIAL=${WWAN_DIAL:-*99#}
 # служебная, основной main при этом не трогается и управляющий adb не рвётся.
 TABLE=${WWAN_TABLE:-99}
 # Запасные значения для hilink-ветки, если DHCP почему-то ничего не отдал.
-# Сколько раз (с паузой 2 с) спрашивать AT у только что появившегося порта, прежде
-# чем считать модем мёртвым. Десять попыток — 20 секунд потолка; на стенде хватает
-# одной-двух.
-AT_WAIT_TRIES=${WWAN_AT_WAIT_TRIES:-10}
+# Сколько секунд перебирать ttyUSB в поисках отвечающего на AT, прежде чем считать
+# модем мёртвым. Бюджет по времени, а не по числу попыток: портов у устройства может
+# быть и три, и круг по ним сам по себе занимает несколько секунд. На стенде порт
+# отзывается на первом же круге, потолок нужен только чтобы не висеть на мёртвом.
+AT_WAIT_SECS=${WWAN_AT_WAIT_SECS:-20}
 HILINK_ADDR=${WWAN_HILINK_ADDR:-192.168.0.178}
 HILINK_GW=${WWAN_HILINK_GW:-192.168.0.1}
 
@@ -154,6 +155,12 @@ find_usb_dev() {
 
 # ttyUSB, соответствующий интерфейсу с заданным bInterfaceProtocol
 # (10 = modem/PPP-порт, 12 = PCUI/AT-порт).
+#
+# Работает только на «новых» свистках (E303, E3272, E353). Старая серия — E173
+# (12d1:1c05), E1750, E220 — выставляет 0xFF у ВСЕХ интерфейсов сразу, никакого
+# протокола 12 там нет вовсе, и догадка уходит в никуда. Поэтому результат этой
+# функции — только первый кандидат, а не приговор: реальный порт ищется опросом,
+# см. at_candidates() и стадию «SIM и регистрация в сети».
 port_for_proto() {
 	for i in "$USB_DEV":*; do
 		[ -f "$i/bInterfaceProtocol" ] || continue
@@ -165,6 +172,23 @@ port_for_proto() {
 		done
 	done
 	return 1
+}
+
+# Все ttyUSB этого устройства — в том порядке, в каком имеет смысл спрашивать AT:
+# сначала догадка по протоколу, потом остальные, модемный последним (на нём AT
+# обычно тоже отвечает, но занимать его до дозвона незачем).
+at_candidates() {
+	_ac_list=""
+	[ -c "$CTRL_TTY" ] && _ac_list="$CTRL_TTY"
+	for _ac_t in $(ls -d "$USB_DEV":*/ttyUSB* 2>/dev/null | sed 's|.*/||' | sort -u); do
+		[ -c "/dev/$_ac_t" ] || continue
+		[ "/dev/$_ac_t" = "$CTRL_TTY" ] && continue
+		[ "/dev/$_ac_t" = "$MODEM_TTY" ] && continue
+		_ac_list="$_ac_list /dev/$_ac_t"
+	done
+	[ -c "$MODEM_TTY" ] && [ "$MODEM_TTY" != "$CTRL_TTY" ] &&
+		_ac_list="$_ac_list $MODEM_TTY"
+	echo $_ac_list
 }
 
 ko_vermagic() { grep -ao 'vermagic=[^[:space:]]*' "$1" 2>/dev/null | head -1 | cut -d= -f2; }
@@ -544,8 +568,17 @@ if [ "$MODE" = ppp ]; then
 		MODEM_TTY=$(port_for_proto 10) || MODEM_TTY=/dev/ttyUSB0
 		CTRL_TTY=$(port_for_proto 12)  || CTRL_TTY=/dev/ttyUSB1
 		[ -c "$CTRL_TTY" ] || CTRL_TTY=$MODEM_TTY
-		ok "модемный порт $MODEM_TTY, управляющий $CTRL_TTY"
+		ok "модемный порт $MODEM_TTY, управляющий $CTRL_TTY (предположительно)"
 		ok "привязано интерфейсов: $(ls -d "$USB_DEV":*/ttyUSB* 2>/dev/null | wc -l)"
+		# Раскладку печатаем всегда: на незнакомом свистке это единственный способ
+		# понять, почему выбран тот порт, а не другой, — особенно когда до головы
+		# нет доступа по adb и весь разбор идёт по этому тексту на экране.
+		for _i in "$USB_DEV":*; do
+			[ -f "$_i/bInterfaceProtocol" ] || continue
+			_pr=$(cat "$_i/bInterfaceProtocol" 2>/dev/null)
+			_tt=$(ls -d "$_i"/ttyUSB* 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')
+			say "      $(basename "$_i")  protocol=$_pr  ${_tt:-без ttyUSB}"
+		done
 	fi
 
 	stage "PPP в ядре"
@@ -575,25 +608,43 @@ if [ "$MODE" = ppp ]; then
 		# и связь появлялась только со следующей проверкой watchdog'а. Ожидание тут
 		# не фиксированное: обычно порт отвечает с первой-второй попытки, а потолок
 		# нужен ровно для того, чтобы не висеть вечно на мёртвом модеме.
-		_w=0
-		_r=""
+		# Спрашиваем КАЖДЫЙ ttyUSB устройства, а не только тот, на который указал
+		# bInterfaceProtocol. На E173 (12d1:1c05) протокола 12 нет ни у одного
+		# интерфейса, догадка даёт ttyUSB1, а он молчит — и весь подъём падал здесь,
+		# хотя модем исправен и AT отвечает на соседнем порту.
+		_guess=$CTRL_TTY
+		_cands=$(at_candidates)
+		[ -n "$_cands" ] || die "у устройства нет ни одного ttyUSB" \
+			"смотри стадию 6: привязался ли option к интерфейсам"
+		_deadline=$(( $(date +%s) + AT_WAIT_SECS ))
+		_found=""
 		while :; do
-			at "$CTRL_TTY" "ATE0" 1 >/dev/null 2>&1
-			# Регистр ответов приводим к верхнему: на части портов включён iuclc и
-			# модем отвечает "ok" вместо "OK".
-			_r=$(at "$CTRL_TTY" "AT" 2 | tr 'a-z' 'A-Z')
-			case "$_r" in
-			*OK*) break ;;
-			esac
-			_w=$((_w + 1))
-			[ "$_w" -ge "$AT_WAIT_TRIES" ] && break
+			for _cand in $_cands; do
+				at "$_cand" "ATE0" 1 >/dev/null 2>&1
+				# Регистр ответов приводим к верхнему: на части портов включён iuclc
+				# и модем отвечает "ok" вместо "OK".
+				case "$(at "$_cand" "AT" 2 | tr 'a-z' 'A-Z')" in
+				*OK*) _found=$_cand; break ;;
+				esac
+			done
+			[ -n "$_found" ] && break
+			[ "$(date +%s)" -ge "$_deadline" ] && break
 			sleep 2
 		done
-		case "$_r" in
-		*OK*) ok "порт $CTRL_TTY отвечает$([ "$_w" -gt 0 ] && echo " (с попытки $((_w + 1)))")" ;;
-		*)    die "порт $CTRL_TTY не отвечает на AT (ждали $((AT_WAIT_TRIES * 2)) с)" \
-			    "порт мог занять другой процесс; проверь другой ttyUSB" ;;
-		esac
+		if [ -n "$_found" ]; then
+			CTRL_TTY=$_found
+			if [ "$_found" = "$_guess" ]; then
+				ok "порт $CTRL_TTY отвечает"
+			else
+				ok "AT отвечает $CTRL_TTY (догадка $_guess молчит)"
+			fi
+			# Кладём найденный порт рядом: иконка сети берёт его отсюда и не
+			# повторяет тот же перебор со своей стороны.
+			[ "$CHECK_ONLY" = 1 ] || echo "$CTRL_TTY" >"$STATE/at-tty" 2>/dev/null
+		else
+			die "ни один порт не отвечает на AT: $_cands (ждали $AT_WAIT_SECS с)" \
+			    "порт мог занять другой процесс, либо модем ещё не готов"
+		fi
 
 		_r=$(at "$CTRL_TTY" "AT+CPIN?" 3 | tr 'a-z' 'A-Z')
 		case "$_r" in

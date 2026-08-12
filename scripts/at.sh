@@ -10,13 +10,22 @@ stty -F "$P" raw -echo -iuclc min 0 time 5 >/dev/null 2>&1
 # Подоболочка + --foreground: без них порт может стать управляющим терминалом
 # сессии, и чтение из фоновой группы процессов встанет на SIGTTIN навсегда
 # (подробности — в комментарии к at() в wwan-up.sh).
-(
+#
+# Внешний timeout — на ВСЮ подоболочку, включая `exec 3<>`. Внутренние накрывают
+# только чтение, а заблокироваться умеет и само открытие порта: без CLOCAL open()
+# ждёт несущую сколько угодно. Пока порт был один и заведомо рабочий, это не
+# всплывало; с перебором незнакомых ttyUSB (E173 и прочая старая серия) один
+# молчащий диагностический порт иначе вешает весь подъём.
+AT_HARD_TIMEOUT=${AT_HARD_TIMEOUT:-$(( 3 + 3 * $# ))}
+timeout --foreground "$AT_HARD_TIMEOUT" sh -c '
+	P=$1
+	shift
 	exec 3<>"$P" || exit 1
 	timeout --foreground 1 cat <&3 >/dev/null 2>&1
 	for c in "$@"; do
-		printf '%s\r' "$c" >&3
+		printf "%s\r" "$c" >&3
 		echo "> $c"
-		timeout --foreground 2 cat <&3 | tr -d '\r'
+		timeout --foreground 2 cat <&3 | tr -d "\r"
 		echo
 	done
-)
+' sh "$P" "$@"
