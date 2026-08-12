@@ -113,6 +113,12 @@ public final class TboxWire {
     static int tcpPort = 30542;
     static int offerMs = 1000;   // cyclic_offer_delay из SdConfig
     static int notifyMs = 5000;
+    /**
+     * Такт анимации «идёт подключение»: 5 шагов по 0.5 с — полный пробег палок за 2.5 с.
+     * Опрос модема при этом чаще не становится: readSignal() кеширует его на MODEM_POLL_MS,
+     * а анимация подменяет только число палок.
+     */
+    static final int CONNECTING_NOTIFY_MS = 500;
     static int ttl = 3;          // TTL из SdConfig; в SD это секунды жизни оффера
     static int fixedStrength = Integer.MIN_VALUE;  // MIN_VALUE == брать реальный сигнал модема
     static boolean probeOnly = false;  // только offer + дамп входящего, без TCP и событий
@@ -348,11 +354,29 @@ public final class TboxWire {
         Thread t = new Thread(new Runnable() {
             public void run() {
                 int n = 0;
+                int tick = 0;
+                boolean wasConnecting = false;
                 while (true) {
                     try {
-                        Thread.sleep(notifyMs);
+                        // Пока идёт подъём — такт чаще: на 5 секундах «бег» палок
+                        // выглядит не движением, а случайными скачками уровня.
+                        Thread.sleep(wasConnecting ? CONNECTING_NOTIFY_MS : notifyMs);
                     } catch (InterruptedException e) { return; }
                     Sig sig = readSignal();
+                    // Радио не зарегистрировано, но подъём прямо сейчас идёт: вместо крестика
+                    // гоняем палки. Как только модем зарегистрируется, ветка отключается сама
+                    // и на экране оказывается настоящий уровень.
+                    if (sig.reg == REG_NONE) {
+                        String stage = bringUpStage();
+                        wasConnecting = stage != null;
+                        if (wasConnecting) {
+                            sig = new Sig(REG_STATUS_REGISTERED, connectingStrength(tick++),
+                                    "подключение: " + stage);
+                        }
+                    } else {
+                        wasConnecting = false;
+                        tick = 0;
+                    }
                     byte[] msg = buildNotification(buildPayload(sig.reg, ESIM_STATUS_OK,
                             SERVICE_STATUS_CONNECTED, ROAMING_NONE, sig.strength, 0));
                     n++;
@@ -794,6 +818,37 @@ public final class TboxWire {
     static Sig pollModemSafe() {
         try { return pollModem(); }
         catch (Throwable t) { return new Sig(REG_STATUS_NONE, -1, "ошибка опроса: " + t); }
+    }
+
+    // ------------------------------------------------------------------ «идёт подключение»
+    //
+    // Отдельной картинки «поиск сети» у головы нет: SeresStatusBarSignalPolicy умеет только
+    // крестик и палки поверх значка поколения. А подъём модема после перезагрузки занимает
+    // до минуты с лишним (модули, modeswitch, регистрация, дозвон), и всё это время крестик
+    // неотличим от «модема нет вообще». Поэтому, пока wwan-up.sh работает, а радио ещё не
+    // зарегистрировалось, палки гоняются по кругу 0→4 — как «поиск сети» на телефоне.
+    //
+    // Живость подъёма берётся из state/busy (его пишет stage() в wwan-up.sh): первое слово —
+    // pid, дальше название стадии. Сверяем cmdline, потому что файл переживает и падение
+    // скрипта, и перезагрузку: без этого анимация осталась бы навсегда, обещая подключение,
+    // которого никто не делает. Умер скрипт — со следующего же уведомления честный крестик.
+
+    /** Название текущей стадии подъёма, или null, если прямо сейчас никто ничего не поднимает. */
+    static String bringUpStage() {
+        String s = readFirstLine(wwanDir + "/state/busy");
+        if (s == null) return null;
+        s = s.trim();
+        int sp = s.indexOf(' ');
+        String pid = sp < 0 ? s : s.substring(0, sp);
+        if (!pid.matches("[1-9]\\d*")) return null;
+        String cmdline = readFirstLine("/proc/" + pid + "/cmdline");
+        if (cmdline == null || cmdline.indexOf("wwan-up") < 0) return null;
+        return sp < 0 ? "подъём" : s.substring(sp + 1);
+    }
+
+    /** Сколько палок показать на этом такте анимации: 0,1,2,3,4 и снова 0. */
+    static int connectingStrength(int tick) {
+        return tick % 5;
     }
 
     static String readFirstLine(String path) {

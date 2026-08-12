@@ -135,6 +135,14 @@ status)
 	echo "алиас:    $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | grep " $SRC_IP/" |
 		sed 's/  */ /g' || echo "нет $SRC_IP на $IFACE")"
 	echo "WAN:      $(cat "$STATE/wan-iface" 2>/dev/null || echo "неизвестен (модем не поднимали)")"
+	# Пока тут живой pid wwan-up.sh, иконка вместо крестика гоняет палки по кругу.
+	_b=$(cat "$STATE/busy" 2>/dev/null)
+	_bp=${_b%% *}
+	if [ -n "${_bp:-}" ] && grep -qs wwan-up "/proc/$_bp/cmdline" 2>/dev/null; then
+		echo "подъём:   идёт — ${_b#* } (pid $_bp), палки анимируются"
+	else
+		echo "подъём:   не идёт${_b:+ (последняя стадия: ${_b#* })}"
+	fi
 	[ -f "$LOG" ] && { echo "-- последние строки $LOG:"; tail -8 "$LOG"; }
 	;;
 
