@@ -363,10 +363,14 @@ public final class TboxWire {
                         Thread.sleep(wasConnecting ? CONNECTING_NOTIFY_MS : notifyMs);
                     } catch (InterruptedException e) { return; }
                     Sig sig = readSignal();
-                    // Радио не зарегистрировано, но подъём прямо сейчас идёт: вместо крестика
-                    // гоняем палки. Как только модем зарегистрируется, ветка отключается сама
-                    // и на экране оказывается настоящий уровень.
-                    if (sig.reg == REG_NONE) {
+                    // Настоящего уровня ещё нет, а подъём прямо сейчас идёт: гоняем палки.
+                    // Условие именно про measured, а не про reg == REG_NONE (как было
+                    // сначала): пока модем не ответил, наружу уходит правдоподобная заглушка
+                    // «4G, три палки» — genToReg(null) + STRENGTH_WHEN_UNKNOWN, — и по
+                    // крестику стадию подъёма не поймать, его просто не бывает. На стенде
+                    // из-за этого анимация не показалась ни разу: весь подъём в логе стоял
+                    // reg=6 strength=3 (линка ещё нет, CSQ неизвестен).
+                    if (!sig.measured) {
                         String stage = bringUpStage();
                         wasConnecting = stage != null;
                         if (wasConnecting) {
@@ -452,8 +456,19 @@ public final class TboxWire {
         final int reg;         // celluarRegisterStatus: 0 — сети нет, 6 — 4G
         final int strength;    // 0..5, -1 — неизвестно
         final String detail;   // человеческое пояснение для лога
+        /**
+         * Уровень измерен по-настоящему (CSQ у ppp, signalbar у hilink), а не подставлен.
+         * Именно этим отличается «показываем реальный сигнал» от «пока сказать нечего»: во
+         * втором случае в поля уходит правдоподобная заглушка (4G + три палки), по которой
+         * снаружи не отличить готовую сеть от модема, который ещё даже не ответил.
+         */
+        final boolean measured;
         Sig(int reg, int strength, String detail) {
+            this(reg, strength, detail, false);
+        }
+        Sig(int reg, int strength, String detail, boolean measured) {
             this.reg = reg; this.strength = strength; this.detail = detail;
+            this.measured = measured;
         }
     }
 
@@ -540,7 +555,7 @@ public final class TboxWire {
                     stage + ", CSQ неизвестен (" + csq + "), " + who);
         }
         return new Sig(genToReg(gen), csqToStrength(csq),
-                stage + ", CSQ " + csq + " на " + tty + ", " + who);
+                stage + ", CSQ " + csq + " на " + tty + ", " + who, true);
     }
 
     /** Поколение сети -> celluarRegisterStatus. null (не выяснили) — считаем 4G. */
@@ -665,7 +680,7 @@ public final class TboxWire {
         if (bars < 0) return new Sig(genToReg(gen), STRENGTH_WHEN_UNKNOWN,
                 "линк " + iface + ", Huawei API без SignalIcon, " + rat);
         return new Sig(bars > 0 ? genToReg(gen) : REG_NONE, clampBars(bars),
-                "линк " + iface + ", Huawei API " + gw + ": " + bars + "/5, " + rat);
+                "линк " + iface + ", Huawei API " + gw + ": " + bars + "/5, " + rat, true);
     }
 
     /** @return null, если это не ZTE-API. */
@@ -683,7 +698,7 @@ public final class TboxWire {
                 "линк " + iface + ", ZTE API без signalbar, " + rat);
         return new Sig(bars > 0 ? genToReg(gen) : REG_NONE, clampBars(bars),
                 "линк " + iface + ", ZTE API " + gw + ": " + bars + "/5, " + rat
-                        + (rssi == null ? "" : ", rssi " + rssi));
+                        + (rssi == null ? "" : ", rssi " + rssi), true);
     }
 
     /** CurrentNetworkType из Huawei-API (значения из их же web-ui). */
