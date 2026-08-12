@@ -633,14 +633,23 @@ public final class TboxWire {
                 stage + ", CSQ " + csq + " на " + tty + ", " + who, true);
     }
 
-    /** Поколение сети -> celluarRegisterStatus. null (не выяснили) — считаем 4G. */
+    /**
+     * Поколение сети -> celluarRegisterStatus.
+     *
+     * Зарегистрирован — значит шлём 6, независимо от поколения. Из всех значений switch'а
+     * в SeresStatusBarSignalPolicy на железе проверено ровно одно: 6 даёт видимые палки.
+     * Остальные группы (1, 2, 4) выведены из порядка и размера групп, но глазами их никто
+     * не смотрел, и 2026-08-12 выяснилось, что как минимум одна из них не рисует ничего:
+     * у коллеги с E173s-1 модем работал (CSQ 16, +CREG: 0,1, t2 rus), а иконки не было.
+     * E173 — свисток чисто 3G, всегда отдаёт AcT=2, мы всегда слали REG_3G=3 → пусто.
+     * На нашем стенде это не могло всплыть: E3272 на beeline всегда рапортует 4G.
+     *
+     * Поколение по-прежнему определяется и попадает в текст лога — теряется только
+     * попытка отразить его в иконке, которая всё равно ни разу не сработала. Перебрать
+     * значения руками, если однажды дойдут руки: `tbox-icon.sh fake 4 --reg N`.
+     */
     static int genToReg(String gen) {
-        if (gen == null) return REG_STATUS_REGISTERED;
-        if (gen.equals("2G")) return REG_2G;
-        if (gen.equals("3G")) return REG_3G;
-        if (gen.equals("4G")) return REG_4G;
-        if (gen.equals("5G")) return REG_5G;
-        if (gen.equals("нет сети")) return REG_NONE;
+        if ("нет сети".equals(gen)) return REG_NONE;
         return REG_STATUS_REGISTERED;
     }
 
