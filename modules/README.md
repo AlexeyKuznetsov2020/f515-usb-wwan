@@ -1,10 +1,24 @@
-# Модули ядра: usbserialmerged2, ppp_async
+# Модули ядра: usbserialmerged2, ppp_async, NCM-тройка
 
 Ядро головы (`5.4.86-qgki-...`) не собрано с `CONFIG_USB_SERIAL` и `CONFIG_PPP_ASYNC` —
-без них Huawei-модем не отдаёт AT/PPP-порты и PPP-дозвон невозможен. Готовые `.ko` лежат
-в [`prebuilt/`](prebuilt/) и подходят ровно для этого ядра (совпадение проверяется по
-`vermagic` прямо в `wwan-up.sh` перед загрузкой). Пересобирать нужно только если у тебя
-другая версия ядра/сборки.
+без них Huawei-модем не отдаёт AT/PPP-порты и PPP-дозвон невозможен. Там же выключены
+`CONFIG_USB_NET_CDC_NCM`, `CONFIG_USB_NET_HUAWEI_CDC_NCM` и `CONFIG_USB_WDM` — без них не
+работает вторая половина Huawei-модемов, у которых канал данных не AT/PPP-порт, а NCM.
+Готовые `.ko` лежат в [`prebuilt/`](prebuilt/) и подходят ровно для этого ядра
+(совпадение проверяется по `vermagic` прямо в `wwan-up.sh` перед загрузкой). Пересобирать
+нужно только если у тебя другая версия ядра/сборки.
+
+| Модуль | Зачем | Ветка |
+|---|---|---|
+| `usbserialmerged2.ko` | `usb-serial` + `option`: даёт `/dev/ttyUSB*` | PPP |
+| `ppp_async.ko` | line discipline `ppp` для дозвона | PPP |
+| `cdc-wdm.ko` | служебный WDM-канал NCM-функции | NCM |
+| `cdc_ncm.ko` | собственно NCM поверх встроенного `usbnet` | NCM |
+| `huawei_cdc_ncm.ko` | NCM Huawei, спрятанный за vendor-классом `ff/02/16` | NCM |
+
+NCM-тройке повезло: каркас `usbnet` в ядре головы **встроен** (`CONFIG_USB_USBNET=y`,
+`CONFIG_MII=y`, 41 экспортируемый символ `usbnet_*`), поэтому драйверы собираются как
+внешние модули без единой правки исходников — берутся из дерева ядра как есть.
 
 ## Важно: тулчейн должен совпадать с ядром
 
@@ -26,7 +40,23 @@ adb shell zcat /proc/config.gz > running.config   # или /proc/config, смо�
 # 3. Собрать
 ./build-cfi.sh src/usbserial
 ./build-cfi.sh src/ppp
+./build-cfi.sh src/ncm
 ```
+
+Исходники ядра головы — CodeLinaro `msm-5.4`, тег `LA.AU.1.3.2.r2-03600-sa8155_gvmq.0`
+(это ровно 5.4.86 и ровно та платформа: SA8155, Android-гость под гипервизором):
+
+```bash
+git clone --depth 1 -b LA.AU.1.3.2.r2-03600-sa8155_gvmq.0 \
+    https://git.codelinaro.org/clo/la/kernel/msm-5.4.git
+printf -- '-g310fb9b27fcd-dirty' > msm-5.4/.scmversion   # хвост uname -r головы
+```
+
+`.scmversion` обязателен: в конфиге головы `CONFIG_LOCALVERSION="-qgki"` и
+`CONFIG_LOCALVERSION_AUTO=y`, то есть хвост `-g310fb9b27fcd-dirty` дописывает
+`scripts/setlocalversion`. Коммит OEM-овский, в CLO его нет (сборка к тому же помечена
+`dirty`), поэтому строку просто фиксируем файлом — иначе `vermagic` не сойдётся и
+`wwan-up.sh` откажется грузить модуль.
 
 `build-cfi.sh` при первом запуске конфигурирует дерево ядра под этот тулчейн
 (`running.config` + `olddefconfig`), после чего собирает указанный внешний модуль и
@@ -50,5 +80,10 @@ python3 extract-symvers.py oem.symvers /vendor/lib/modules/*.ko   # только
   из `drivers/usb/serial/` апстримного дерева этого ядра, собираются в один
   `usbserialmerged2.ko`.
 - `src/ppp/ppp_async.c` — копия `drivers/net/ppp/ppp_async.c`, даёt line discipline `ppp`.
+- `src/ncm/` — копии `drivers/usb/class/cdc-wdm.c`, `drivers/net/usb/cdc_ncm.c` и
+  `drivers/net/usb/huawei_cdc_ncm.c` **без единой правки**: таблица
+  `huawei_cdc_ncm_devs` уже содержит нужную четвёрку `(12d1, ff, 02, 16)`. В отличие от
+  usbserial в один `.ko` не сливаются — межмодульные символы modpost разрешает сам,
+  раз все три собираются одним проходом.
 - `prebuilt/*.ko` — готовые модули для `5.4.86-qgki-g310fb9b27fcd-dirty`.
 - `build-cfi.sh`, `extract-symvers.py`, `oem.symvers` — инструменты пересборки.

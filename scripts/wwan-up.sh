@@ -3,7 +3,9 @@
 #
 # Умеет два типа модемов и определяет тип сам:
 #   hilink — модем сам роутер и отдаёт себя как USB-сетевую карту (ZTE MF833R и любой
-#            другой CDC-Ethernet/RNDIS): нужен только DHCP, ядро уже умеет всё само;
+#            другой CDC-Ethernet/RNDIS): нужен только DHCP, ядро уже умеет всё само.
+#            Huawei-модемы с HiLink-прошивкой (E8278, E8372, E3372 в NCM-режиме)
+#            сюда же, но им сначала нужны три модуля ядра — см. стадию «NCM»;
 #   ppp    — модем отдаёт AT/PPP-порты (Huawei E17x/E1750/E3272, 12d1:*): нужен
 #            modeswitch, два модуля ядра и дозвон через pppd.
 # Принудительно тип задаётся через WWAN_MODE=hilink|ppp.
@@ -39,12 +41,12 @@ DIAL=${WWAN_DIAL:-*99#}
 # Куда класть маршрут модема. 99 = «legacy_system» в терминах Android; таблица
 # служебная, основной main при этом не трогается и управляющий adb не рвётся.
 TABLE=${WWAN_TABLE:-99}
-# Запасные значения для hilink-ветки, если DHCP почему-то ничего не отдал.
 # Сколько секунд перебирать ttyUSB в поисках отвечающего на AT, прежде чем считать
 # модем мёртвым. Бюджет по времени, а не по числу попыток: портов у устройства может
 # быть и три, и круг по ним сам по себе занимает несколько секунд. На стенде порт
 # отзывается на первом же круге, потолок нужен только чтобы не висеть на мёртвом.
 AT_WAIT_SECS=${WWAN_AT_WAIT_SECS:-20}
+# Запасные значения для hilink-ветки, если DHCP почему-то ничего не отдал.
 HILINK_ADDR=${WWAN_HILINK_ADDR:-192.168.0.178}
 HILINK_GW=${WWAN_HILINK_GW:-192.168.0.1}
 
@@ -131,12 +133,62 @@ find_hilink_iface() {
 		*) continue ;;
 		esac
 		case "$(basename "$drv")" in
-		cdc_ether | rndis_host | cdc_ncm)
+		cdc_ether | rndis_host | cdc_ncm | huawei_cdc_ncm)
 			HILINK_IF=$(basename "$d")
+			HILINK_DRV=$(basename "$drv")
 			return 0 ;;
 		esac
 	done
 	return 1
+}
+
+# NCM-интерфейс Huawei: канал данных HiLink-прошивки, спрятанный за
+# vendor-specific классом. Апстримный huawei_cdc_ncm ловит его по
+# (12d1, class ff, subclass 02|03, protocol 16|46|76) — здесь та же четвёрка,
+# чтобы решать «есть кого поднимать» до загрузки модулей. Значения в sysfs
+# шестнадцатеричные, ровно как в таблице драйвера.
+find_ncm_iface() {
+	# Сначала отсекаем обычные AT/PPP-свистки. Интерфейс ff/02/16 есть и у них: на
+	# E3272 (12d1:1506) это ttyUSB2, живой последовательный порт под option, и
+	# именно на нём у E173 отвечает AT. Без этой проверки стадия отбирала порт у
+	# option на исправном PPP-модеме, сетевой интерфейс не появлялся, и подъём падал
+	# (проверено на стенде 2026-08-12). Признак настоящей HiLink/NCM-прошивки —
+	# ОТСУТСТВИЕ модемного порта ff/02/10: у E8278 и родни PPP-порта нет вовсе,
+	# AT^SETPORT отвергает код 10. Дескрипторы есть на шине всегда, поэтому проверка
+	# работает и на холодном старте, когда ttyUSB ещё не созданы.
+	for i in /sys/bus/usb/devices/*:*; do
+		[ -f "$i/bInterfaceClass" ] || continue
+		[ "$(cat "$i/../idVendor" 2>/dev/null)" = "12d1" ] || continue
+		[ "$(cat "$i/bInterfaceClass" 2>/dev/null)" = "ff" ] || continue
+		[ "$(cat "$i/bInterfaceSubClass" 2>/dev/null)" = "02" ] || continue
+		if [ "$(cat "$i/bInterfaceProtocol" 2>/dev/null)" = "10" ]; then
+			NCM_SKIP="есть модемный порт ff/02/10 ($(basename "$i")) — это AT/PPP-свисток"
+			return 1
+		fi
+	done
+	for i in /sys/bus/usb/devices/*:*; do
+		[ -f "$i/bInterfaceClass" ] || continue
+		[ "$(cat "$i/../idVendor" 2>/dev/null)" = "12d1" ] || continue
+		[ "$(cat "$i/bInterfaceClass" 2>/dev/null)" = "ff" ] || continue
+		_sc=$(cat "$i/bInterfaceSubClass" 2>/dev/null)
+		_pr=$(cat "$i/bInterfaceProtocol" 2>/dev/null)
+		case "$_sc:$_pr" in
+		02:16 | 02:46 | 02:76 | 03:16) ;;
+		*) continue ;;
+		esac
+		NCM_IF=$i
+		NCM_ID="ff/$_sc/$_pr"
+		return 0
+	done
+	return 1
+}
+
+# Каталог с .ko: рядом со скриптом, иначе /data/local/tmp, куда их кладёт
+# приложение. Аргумент — файл-маркер, по которому каталог опознаётся.
+mod_dir() {
+	_d=${WWAN_MODDIR:-$DIR}
+	[ -f "$_d/$1" ] || _d=$TMP
+	echo "$_d"
 }
 
 # Каталог модема в sysfs + его VID/PID (Huawei-семейство).
@@ -381,6 +433,110 @@ if [ "$CHECK_ONLY" = 0 ] && [ -x "$DIR/tbox-icon.sh" ]; then
 	sh "$DIR/tbox-icon.sh" auto >/dev/null 2>&1 &
 fi
 
+# --------------------------------------------------- режим модема ---------
+# Huawei приходит на шину виртуальным CD-ROM'ом (storage-PID) и показывает
+# настоящие интерфейсы только после SCSI-команды переключения. Стадия стоит ДО
+# определения типа модема: пока модем в storage-режиме, его не опознать ни как
+# NCM, ни как PPP — нужных интерфейсов на шине просто нет.
+stage "режим модема"
+NEED_SWITCH=0
+if ! find_usb_dev; then
+	skip "Huawei (12d1:*) на шине нет — переключать нечего"
+else
+	MODESWITCH=${WWAN_MODESWITCH:-$(mod_dir huawei-modeswitch)/huawei-modeswitch}
+	case "$USB_PID" in
+	1506 | 1465 | 140c | 1c05 | 14ac) ok "режим с рабочими интерфейсами" ;;
+	14fe | 1f01 | 1f02 | 1446 | 14ad | 1c0b)
+		NEED_SWITCH=1
+		warn "модем в storage-режиме — нужен modeswitch" ;;
+	*)
+		warn "PID $USB_PID незнакомый — пробуем как есть" ;;
+	esac
+
+	if [ "$NEED_SWITCH" = 0 ]; then
+		skip "modeswitch не требуется"
+	else
+		[ -f "$MODESWITCH" ] || die "нужен modeswitch, но $MODESWITCH отсутствует" \
+			"собрать tools/build-tools.sh и положить бинарь рядом"
+		[ -x "$MODESWITCH" ] || chmod 755 "$MODESWITCH"
+		if [ "$CHECK_ONLY" = 1 ]; then
+			say "   [dry ] $MODESWITCH"
+		else
+			"$MODESWITCH" 2>&1 | while read -r l; do say "   $l"; done
+			# Модем переподключается с новым PID — ждём появления.
+			i=0
+			while [ $i -lt 20 ]; do
+				sleep 1
+				if find_usb_dev && [ "$USB_PID" != "14fe" ]; then break; fi
+				i=$((i + 1))
+			done
+			find_usb_dev || die "после modeswitch модем пропал с шины" \
+				"вытащить и вставить модем, затем запустить скрипт заново"
+			case "$USB_PID" in
+			14fe | 1f01 | 1f02 | 1446 | 14ad | 1c0b)
+				die "modeswitch не сработал, PID остался $USB_PID" \
+					"проверь, что ядро не держит usb-storage, и попробуй ещё раз" ;;
+			esac
+			ok "переключён в $USB_VID:$USB_PID"
+		fi
+	fi
+fi
+
+# ----------------------------------------------------------- NCM -----------
+# HiLink-прошивка Huawei отдаёт канал данных не AT/PPP-портом, а сетевым
+# интерфейсом NCM, спрятанным за vendor-specific классом (ff/02/16). Каркас для
+# него — usbnet — в ядре головы встроен (CONFIG_USB_USBNET=y, CONFIG_MII=y), а
+# сами драйверы выключены (CONFIG_USB_NET_CDC_NCM / CONFIG_USB_NET_HUAWEI_CDC_NCM
+# / CONFIG_USB_WDM = n), поэтому интерфейс не появляется сам. Довозим их
+# модулями — ровно так же, как usbserial+option для PPP-ветки. После этого модем
+# становится обычным HiLink и идёт по общей ветке: DHCP + маршруты.
+stage "NCM-интерфейс Huawei"
+if [ "${WWAN_MODE:-}" = ppp ]; then
+	skip "задан WWAN_MODE=ppp — NCM не трогаем"
+elif find_hilink_iface; then
+	skip "сетевой интерфейс модема уже есть ($HILINK_IF, драйвер $HILINK_DRV)"
+elif ! find_ncm_iface; then
+	skip "${NCM_SKIP:-NCM-интерфейса Huawei на шине нет} — стадия не нужна"
+else
+	ok "NCM-интерфейс $(basename "$NCM_IF") ($NCM_ID)"
+	NCMDIR=$(mod_dir huawei_cdc_ncm.ko)
+	for f in cdc-wdm.ko cdc_ncm.ko huawei_cdc_ncm.ko; do
+		[ -f "$NCMDIR/$f" ] || die "нет файла $NCMDIR/$f" \
+			"положи modules/prebuilt/*.ko в $TMP или собери: modules/build-cfi.sh src/ncm"
+	done
+	# Порядок обязателен: huawei_cdc_ncm тянет символы из обоих остальных
+	# (usb_cdc_wdm_register, cdc_ncm_bind_common). rmmod на этой голове роняет
+	# ядро — модули только загружаются, никогда не выгружаются.
+	load_module "$NCMDIR/cdc-wdm.ko"        cdc_wdm        /sys/bus/usb/drivers/cdc_wdm
+	load_module "$NCMDIR/cdc_ncm.ko"        cdc_ncm        /sys/bus/usb/drivers/cdc_ncm
+	load_module "$NCMDIR/huawei_cdc_ncm.ko" huawei_cdc_ncm /sys/bus/usb/drivers/huawei_cdc_ncm
+
+	# option из PPP-ветки забирает vendor-specific интерфейсы Huawei целиком,
+	# включая NCM-овский, и тогда huawei_cdc_ncm до него не доберётся: драйвер
+	# у интерфейса может быть только один. Отцепляем и отдаём кому надо — на
+	# самом модеме это ничего не меняет и обратимо перевтыканием.
+	_i=$(basename "$NCM_IF")
+	if [ "$(basename "$(readlink -f "$NCM_IF/driver" 2>/dev/null)" 2>/dev/null)" = option ]; then
+		do_it sh -c "printf %s $_i >/sys/bus/usb/drivers/option/unbind"
+		do_it sh -c "printf %s $_i >/sys/bus/usb/drivers/huawei_cdc_ncm/bind"
+		ok "интерфейс $_i отобран у option и отдан huawei_cdc_ncm"
+	fi
+
+	if [ "$CHECK_ONLY" = 0 ]; then
+		# Интерфейс появляется не мгновенно: huawei_cdc_ncm ещё договаривается
+		# с модемом о формате NTB и заводит WDM-канал.
+		i=0
+		while [ $i -lt 10 ]; do
+			find_hilink_iface && break
+			sleep 1
+			i=$((i + 1))
+		done
+		find_hilink_iface || die "модули загружены, а сетевой интерфейс не появился" \
+			"смотри dmesg на предмет huawei_cdc_ncm/cdc_ncm: интерфейс мог остаться за option"
+		ok "сетевой интерфейс $HILINK_IF (драйвер $HILINK_DRV)"
+	fi
+fi
+
 # --------------------------------------------------------- модем -----------
 stage "какой модем подключён"
 
@@ -393,7 +549,7 @@ if [ -n "$MODE" ]; then
 		"убери WWAN_MODE, чтобы скрипт определил тип сам"; }
 elif find_hilink_iface; then
 	MODE=hilink
-	ok "HiLink-модем: сетевой интерфейс $HILINK_IF (драйвер cdc_ether/rndis)"
+	ok "HiLink-модем: сетевой интерфейс $HILINK_IF (драйвер $HILINK_DRV)"
 elif find_usb_dev; then
 	MODE=ppp
 	ok "найден $USB_VID:$USB_PID ($(basename "$USB_DEV")) — ветка AT/PPP"
@@ -472,11 +628,9 @@ if [ "$MODE" = ppp ]; then
 	WAN_IF=ppp0
 
 	stage "файлы"
-	MODDIR=${WWAN_MODDIR:-$DIR}
-	[ -f "$MODDIR/usbserialmerged2.ko" ] || MODDIR=$TMP
+	MODDIR=$(mod_dir usbserialmerged2.ko)
 	KO_USB=$MODDIR/usbserialmerged2.ko
 	KO_PPP=$MODDIR/ppp_async.ko
-	MODESWITCH=${WWAN_MODESWITCH:-$MODDIR/huawei-modeswitch}
 	DIAL_SH=${WWAN_DIALSH:-$DIR/dial.sh}
 	[ -f "$DIAL_SH" ] || DIAL_SH=$TMP/dial.sh
 
@@ -485,7 +639,6 @@ if [ "$MODE" = ppp ]; then
 	done
 	[ -x "$DIAL_SH" ] || chmod 755 "$DIAL_SH" 2>/dev/null
 	ok "модули и dial.sh найдены в $MODDIR"
-	[ -f "$MODESWITCH" ] || warn "нет $MODESWITCH — если модем окажется в storage-режиме, переключить будет нечем"
 
 	_missing=""
 	for t in insmod lsmod pppd stty; do
@@ -494,44 +647,9 @@ if [ "$MODE" = ppp ]; then
 	[ -z "$_missing" ] || die "в системе нет:$_missing" \
 		"без них PPP-подъём невозможен; pppd обычно /system/bin/pppd"
 
-	stage "режим модема"
-	NEED_SWITCH=0
-	case "$USB_PID" in
-	1506 | 1465 | 140c | 1c05 | 14ac) ok "режим с AT/PPP-портами" ;;
-	14fe | 1f01 | 1f02 | 1446 | 14ad | 1c0b)
-		NEED_SWITCH=1
-		warn "модем в storage-режиме — нужен modeswitch" ;;
-	*)
-		warn "PID $USB_PID незнакомый — пробуем как есть" ;;
-	esac
-
-	if [ "$NEED_SWITCH" = 0 ]; then
-		skip "modeswitch не требуется"
-	else
-		[ -f "$MODESWITCH" ] || die "нужен modeswitch, но $MODESWITCH отсутствует" \
-			"собрать tools/build-tools.sh и положить бинарь рядом"
-		[ -x "$MODESWITCH" ] || chmod 755 "$MODESWITCH"
-		if [ "$CHECK_ONLY" = 1 ]; then
-			say "   [dry ] $MODESWITCH"
-		else
-			"$MODESWITCH" 2>&1 | while read -r l; do say "   $l"; done
-			# Модем переподключается с новым PID — ждём появления.
-			i=0
-			while [ $i -lt 20 ]; do
-				sleep 1
-				if find_usb_dev && [ "$USB_PID" != "14fe" ]; then break; fi
-				i=$((i + 1))
-			done
-			find_usb_dev || die "после modeswitch модем пропал с шины" \
-				"вытащить и вставить модем, затем запустить скрипт заново"
-			case "$USB_PID" in
-			14fe | 1f01 | 1f02 | 1446 | 14ad | 1c0b)
-				die "modeswitch не сработал, PID остался $USB_PID" \
-					"проверь, что ядро не держит usb-storage, и попробуй ещё раз" ;;
-			esac
-			ok "переключён в $USB_VID:$USB_PID"
-		fi
-	fi
+	# Стадия «режим модема» (modeswitch из storage-режима) отработала раньше, до
+	# определения типа: без неё на шине нет ни NCM-, ни AT/PPP-интерфейсов.
+	# NEED_SWITCH оттуда нужен ниже, в стадии последовательных портов.
 
 	stage "модуль usbserial+option"
 	# rmmod на этой голове роняет ядро — выгружать модули нельзя ни при каких условиях.
