@@ -99,8 +99,11 @@ log_trim() {
 }
 
 # Все логи проекта в одном месте: сторож — единственный, кто работает постоянно,
-# и следить за размерами удобнее ему. ppp.log сюда же, хотя пишет его pppd.
-LOG_FILES="$LOG $STATE/boot-stdout.log $STATE/tbox.log /data/local/tmp/wwan.log /data/local/tmp/ppp.log"
+# и следить за размерами удобнее ему. Список полный намеренно, включая те, что
+# пишет не он: ppp.log принадлежит pppd, f515usbwwan.log — format-sdcard.sh (туда
+# уходит вывод fdisk и mkfs.exfat, то есть растёт он рывками и без потолка).
+LOG_FILES="$LOG $STATE/boot-stdout.log $STATE/tbox.log
+	/data/local/tmp/wwan.log /data/local/tmp/ppp.log /data/local/tmp/f515usbwwan.log"
 
 disable() {
 	echo "$(date '+%F %T') $1" >"$DISABLED"
