@@ -1045,16 +1045,20 @@ if [ "$DO_SYSTEM" = 1 ]; then
 	# Правила вендора 9990-9999 «from all lookup main» идут раньше fwmark-правил,
 	# поэтому root/adb-сессиям достаточно default в main.
 	_cur=$(ip route show table main 2>/dev/null | grep '^default')
-	case "$_cur" in
-	*"dev $WAN_IF"*)
-		skip "в main уже default через $WAN_IF" ;;
-	"")
+	# Свой же Wi-Fi-маршрут (его кладёт wifi_priority) за чужой считать нельзя:
+	# иначе после первого подъёма модемный default в main не появится вовсе, и
+	# резерва не будет — падать станет некуда ровно тогда, когда это нужно.
+	_alien=$(echo "$_cur" | grep '^default' |
+		grep -v "dev $WAN_IF " | grep -v "dev wlan[0-9]* metric $WIFI_METRIC")
+	if echo "$_cur" | grep -q "dev $WAN_IF "; then
+		skip "в main уже default через $WAN_IF"
+	elif [ -n "$_alien" ]; then
+		warn "в main уже есть чужой default: $_alien"
+		warn "не трогаю — убери его вручную, если нужен модем"
+	else
 		add_default main 20
-		ok "default через $WAN_IF добавлен в main (metric 20)" ;;
-	*)
-		warn "в main уже есть чужой default: $_cur"
-		warn "не трогаю — убери его вручную, если нужен модем" ;;
-	esac
+		ok "default через $WAN_IF добавлен в main (metric 20 — резерв под Wi-Fi)"
+	fi
 
 	# ...но модем в main — резерв: пока в Wi-Fi есть интернет, он должен быть
 	# приоритетнее (см. wifi_priority выше). Дальше за этим следит watchdog.
