@@ -25,10 +25,10 @@ public class BootReceiver extends BroadcastReceiver {
             return;
         }
         if (!Autostart.isEnabled(context)) {
-            Log.i(TAG, "boot: автозапуск выключен в настройках приложения");
+            Log.w(TAG, "boot: автозапуск выключен в настройках приложения");
             return;
         }
-        Log.i(TAG, "boot: " + action + " -> BootService");
+        Log.w(TAG, "boot: " + action + " -> BootService");
         context.startForegroundService(new Intent(context, BootService.class));
     }
 }

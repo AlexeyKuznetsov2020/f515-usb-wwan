@@ -18,6 +18,13 @@ import android.util.Log;
  */
 public class BootService extends Service {
 
+    /**
+     * Всё, что пишется отсюда, идёт уровнем W намеренно. На этой голове стоит
+     * `persist.log.tag=W`, то есть Log.i из обычного приложения logcat выбрасывает молча -
+     * и разбор «почему после ребута сеть не поднялась» превращается в гадание: службы уже
+     * нет, следов нет. Уровень W ничего не стоит (две-три строки на загрузку), зато делает
+     * автозапуск наблюдаемым без `setprop log.tag.f515usbwwan V` на живой голове.
+     */
     private static final String TAG = "f515usbwwan";
     private static final String CHANNEL = "wwan-boot";
     private static final int NOTIFICATION_ID = 1;
@@ -40,7 +47,7 @@ public class BootService extends Service {
 
         synchronized (BootService.class) {
             if (running || alreadyRan) {
-                Log.i(TAG, "boot: заход уже был в этой загрузке, второй не нужен");
+                Log.w(TAG, "boot: заход уже был в этой загрузке, второй не нужен");
                 stopForeground(true);
                 stopSelf();
                 return START_NOT_STICKY;
@@ -54,17 +61,17 @@ public class BootService extends Service {
             public void run() {
                 try {
                     if (!Autostart.isEnabled(BootService.this)) {
-                        Log.i(TAG, "boot: автозапуск выключен, выхожу");
+                        Log.w(TAG, "boot: автозапуск выключен, выхожу");
                         return;
                     }
                     String out = Keeper.bootAutostart(BootService.this, ADB_ATTEMPTS,
                             new Keeper.Progress() {
                                 @Override
                                 public void onLine(String line) {
-                                    Log.i(TAG, "boot: " + line);
+                                    Log.w(TAG, "boot: " + line);
                                 }
                             });
-                    Log.i(TAG, "boot: готово\n" + out);
+                    Log.w(TAG, "boot: готово\n" + out);
                 } catch (Throwable t) {
                     Log.e(TAG, "boot: сорвалось", t);
                 } finally {

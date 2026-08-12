@@ -68,15 +68,35 @@ public class Keeper {
     }
 
     /**
-     * Starts wwan-boot.sh detached from this adb session: setsid + closed stdio, so the
-     * script (which sleeps, then brings the modem up, then stays as a watchdog) survives
-     * the shell channel closing right after this call returns. A plain background job
-     * would not - that was verified the hard way on this head unit.
+     * Команда запуска wwan-boot.sh, отцепленного от текущей adb-сессии.
+     *
+     * setsid + закрытое stdio - только половина дела. Вторая половина: shell-сервис adbd
+     * сносит всю группу процессов, как только команда напечатала последнюю строку и канал
+     * закрылся, и фоновая копия успевает только родиться. 2026-08-12 на стенде это
+     * выглядело так: приложение рапортует "started", а в boot.log и boot-stdout.log не
+     * появляется ни строки - скрипт не выполнил вообще ничего, и после ребута сеть не
+     * поднималась. Поэтому команда не завершается сразу, а ждёт, пока в pidfile окажется
+     * ЖИВОЙ pid именно wwan-boot.sh (сам pidfile переживает перезагрузку, поэтому мало
+     * проверить, что файл непустой - сверяем cmdline). Ожидание держит канал открытым
+     * ровно столько, сколько потомку нужно, чтобы уйти в свою сессию, и заодно превращает
+     * "started" из обещания в факт: в ответе виден pid.
+     */
+    private static String launchCmd(boolean now) {
+        String pid = DIR + "/state/watchdog.pid";
+        return "mkdir -p " + DIR + "/state; setsid sh " + BOOT + (now ? " --now" : "")
+                + " </dev/null >>" + DIR + "/state/boot-stdout.log 2>&1 &"
+                + " w=; i=0; while [ $i -lt 15 ]; do p=$(cat " + pid + " 2>/dev/null);"
+                + " if [ -n \"$p\" ] && grep -qs wwan-boot /proc/$p/cmdline; then w=$p; break; fi;"
+                + " sleep 1; i=$((i+1)); done;"
+                + " echo \"started, watchdog pid=${w:-НЕ ЗАПУСТИЛСЯ}\"";
+    }
+
+    /**
+     * Starts wwan-boot.sh detached from this adb session; see {@link #launchCmd} for why the
+     * command waits instead of returning the moment the job is backgrounded.
      */
     public static String startAutostart(Context ctx, boolean now, Progress progress) {
-        String cmd = "mkdir -p " + DIR + "/state; setsid sh " + BOOT + (now ? " --now" : "")
-                + " </dev/null >>" + DIR + "/state/boot-stdout.log 2>&1 & echo started";
-        return exec(ctx, null, cmd, progress);
+        return exec(ctx, null, launchCmd(now), progress);
     }
 
     /**
@@ -96,8 +116,7 @@ public class Keeper {
                 }
                 adb.shell("mkdir -p " + DIR);
                 deployMissing(ctx, adb, progress, sb);
-                String out = adb.shell("mkdir -p " + DIR + "/state; setsid sh " + BOOT
-                        + " </dev/null >>" + DIR + "/state/boot-stdout.log 2>&1 & echo started");
+                String out = adb.shell(launchCmd(false));
                 line(progress, sb, "запуск wwan-boot.sh: " + out.trim());
             } catch (Exception e) {
                 line(progress, sb, "автозапуск не состоялся: " + e);
