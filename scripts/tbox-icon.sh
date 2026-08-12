@@ -159,6 +159,16 @@ start)
 		exit 3
 	}
 	add_alias
+	# Логи только дописываются, logrotate на голове нет. Старт — самая удобная
+	# точка усечения: файл ещё никем не открыт, а дальше в него будет писать
+	# живой процесс (в цикле за размером следит watchdog в wwan-boot.sh).
+	LOG_MAX=${WWAN_LOG_MAX:-5242880}
+	_sz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+	if [ "$_sz" -gt "$LOG_MAX" ] 2>/dev/null; then
+		tail -c $((LOG_MAX / 2)) "$LOG" >"$LOG.trim" 2>/dev/null &&
+			cat "$LOG.trim" >"$LOG" 2>/dev/null
+		rm -f "$LOG.trim" 2>/dev/null
+	fi
 	# setsid + закрытый stdin: процесс должен пережить обрыв adb-сессии, из которой
 	# его запустили. Именно так приложение стартует и wwan-boot.sh.
 	setsid sh -c "CLASSPATH=$JAR exec app_process /system/bin --nice-name=tboxwire \
