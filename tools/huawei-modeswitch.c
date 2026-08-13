@@ -15,6 +15,12 @@
  * Если не помог ни один — печатаем полный разбор дескрипторов: без него по одному
  * «не сработало» на чужой голове диагностировать нечего.
  *
+ * Отдельная беда — модем, застрявший без драйвера на storage-интерфейсе: SCSI-сессии
+ * нет, и на bulk-OUT он не отвечает вовсе, запись отваливается по таймауту. Столько
+ * команд туда ни шли — всё мимо. Поэтому осиротевший интерфейс и таймаут на записи
+ * лечатся USB-сбросом (USBDEVFS_RESET): устройство перечисляется заново, ядро
+ * возвращает usb-storage, и команду снова есть кому принять.
+ *
  * Перед этим интерфейс нужно по-настоящему освободить от usb-storage: одного
  * USBDEVFS_DISCONNECT (soft-disconnect на уровне usbfs) недостаточно — сразу после
  * enumerate() ядро может ещё гонять SCSI-команды (INQUIRY/READ CAPACITY) в отдельном
@@ -439,6 +445,58 @@ static int try_config_switch(const struct found *f, int cfg)
 	return 0;
 }
 
+/*
+ * USB-сброс порта: устройство отваливается и перечисляется заново, ядро само
+ * прибинживает к нему usb-storage.
+ *
+ * Нужно вот зачем. Если storage-интерфейс остался без драйвера (например, после
+ * нашего же прошлого неудачного захода), модем перестаёт отвечать на bulk-OUT
+ * совсем: запись не завершается и отваливается по таймауту, сколько бы команд мы
+ * ни слали. SCSI-сессии в этом состоянии нет, и CBW ему просто некуда положить.
+ * Сброс возвращает устройство в исходное состояние — ту самую флешку, которая
+ * умеет принимать команду.
+ *
+ * Ждём возвращения по busid: путь в sysfs переживает переподключение, а devnum
+ * (и /dev/bus/usb/BBB/DDD) меняется, поэтому вызывающий обязан после нас заново
+ * позвать resolve_node().
+ */
+static int reset_device(struct found *f)
+{
+	int fd, i;
+
+	fd = open(f->node, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "сброс: open %s: %s\n", f->node, strerror(errno));
+		return -1;
+	}
+	if (ioctl(fd, USBDEVFS_RESET, NULL) < 0) {
+		/* ENODEV здесь — норма: устройство уже ушло с шины. */
+		if (errno != ENODEV)
+			fprintf(stderr, "сброс: %s\n", strerror(errno));
+	}
+	close(fd);
+
+	for (i = 0; i < 100; i++) {
+		usleep(100000);
+		if (sysfs_hex(f->busid, "idProduct") >= 0 && resolve_node(f) == 0) {
+			char drv[64];
+
+			if (interface_driver(f->busid, f->cfgval, f->ifnum, drv, sizeof(drv)) == 0)
+				printf("сброс: устройство вернулось, драйвер %s\n", drv);
+			else
+				printf("сброс: устройство вернулось, драйвера нет\n");
+			return 0;
+		}
+	}
+	fprintf(stderr, "сброс: устройство не вернулось за 10 с\n");
+	return -1;
+}
+
+/*
+ * Возвращает 0, если команда доехала (или устройство исчезло прямо на записи —
+ * это успех), и 2, если запись отвалилась по таймауту: значит модем не отвечает
+ * и есть смысл его сбросить, а не слать следующую команду в ту же пустоту.
+ */
 static int send_switch(const struct found *f, const uint8_t *msg)
 {
 	struct usbdevfs_ioctl detach;
@@ -468,6 +526,19 @@ static int send_switch(const struct found *f, const uint8_t *msg)
 		return 1;
 	}
 
+	/*
+	 * Снимаем halt с endpoint'а перед записью. После unbind'а usb-storage мог
+	 * оставить его в стопоре, и тогда любая наша команда упирается в стену.
+	 * Устройству без halt'а это ничего не стоит.
+	 */
+	{
+		unsigned int ep = (unsigned int)f->ep_out;
+
+		if (ioctl(fd, USBDEVFS_CLEAR_HALT, &ep) < 0 && errno != ENODEV)
+			fprintf(stderr, "предупреждение: clear halt ep 0x%02x: %s\n",
+				f->ep_out, strerror(errno));
+	}
+
 	memset(&bulk, 0, sizeof(bulk));
 	bulk.ep = (unsigned int)f->ep_out;
 	bulk.len = 31;
@@ -476,15 +547,28 @@ static int send_switch(const struct found *f, const uint8_t *msg)
 
 	transferred = ioctl(fd, USBDEVFS_BULK, &bulk);
 	if (transferred < 0) {
+		int err = errno;
+
+		ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifnum);
+		close(fd);
 		/*
-		 * Модем часто отваливается прямо в момент приёма команды — для нас
-		 * это штатный успех, проверять надо по появлению нового PID.
+		 * ENODEV/EIO — модем отвалился прямо в момент приёма команды, для нас
+		 * это штатный успех: проверять надо по появлению нового PID.
+		 *
+		 * ETIMEDOUT — другое дело. Команда никуда не доехала, устройство
+		 * молчит на endpoint'е. Слать следующую в ту же пустоту бессмысленно,
+		 * сначала надо привести модем в чувство сбросом.
 		 */
+		if (err == ETIMEDOUT) {
+			fprintf(stderr, "bulk: таймаут — модем не отвечает на ep 0x%02x\n",
+				f->ep_out);
+			return 2;
+		}
 		fprintf(stderr, "bulk: %s (обычно это норма — модем уже переподключается)\n",
-			strerror(errno));
-	} else {
-		printf("отправлено %d байт в ep 0x%02x\n", transferred, f->ep_out);
+			strerror(err));
+		return 0;
 	}
+	printf("отправлено %d байт в ep 0x%02x\n", transferred, f->ep_out);
 
 	ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifnum);
 	close(fd);
@@ -494,7 +578,7 @@ static int send_switch(const struct found *f, const uint8_t *msg)
 int main(int argc, char **argv)
 {
 	struct found f;
-	int dry_run = 0, i, wait_secs = 20, custom_ok = 0;
+	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0;
 	uint8_t custom[31];
 	char busid_arg[32] = "";
 
@@ -622,9 +706,24 @@ int main(int argc, char **argv)
 		return send_switch(&f, custom_ok ? custom : methods[0].msg);
 	}
 
+	/*
+	 * Осиротевший storage-интерфейс — само по себе признак беды: модем в таком
+	 * состоянии на bulk-OUT не отвечает вовсе. Сбрасываем сразу, до первой
+	 * команды, чтобы ядро вернуло usb-storage и SCSI-сессию.
+	 */
+	{
+		char drv[64];
+
+		if (interface_driver(f.busid, f.cfgval, f.ifnum, drv, sizeof(drv)) != 0) {
+			printf("storage-интерфейс без драйвера — сбрасываю устройство\n");
+			if (reset_device(&f) == 0)
+				did_reset = 1;
+		}
+	}
+
 	for (i = 0; i < (custom_ok ? 1 : N_METHODS); i++) {
 		const uint8_t *msg = custom_ok ? custom : methods[i].msg;
-		int pid;
+		int pid, rc;
 
 		printf("--- способ %d: %s\n", i + 1,
 		       custom_ok ? "сообщение из -m" : methods[i].name);
@@ -636,7 +735,22 @@ int main(int argc, char **argv)
 		}
 		if (unbind_if_needed(&f) != 0)
 			fprintf(stderr, "unbind не удался, пробуем claim всё равно\n");
-		if (send_switch(&f, msg) != 0)
+		rc = send_switch(&f, msg);
+
+		/*
+		 * Таймаут: команда не доехала. Один раз за весь запуск пробуем
+		 * сбросить модем и повторить этот же способ — дальше смысла нет,
+		 * иначе на мёртвом устройстве мы просто трижды сбросим шину.
+		 */
+		if (rc == 2 && !did_reset) {
+			did_reset = 1;
+			if (reset_device(&f) == 0 && resolve_node(&f) == 0) {
+				if (unbind_if_needed(&f) != 0)
+					fprintf(stderr, "unbind не удался, пробуем claim всё равно\n");
+				rc = send_switch(&f, msg);
+			}
+		}
+		if (rc != 0)
 			continue;
 
 		pid = wait_for_switch(f.busid, wait_secs);
