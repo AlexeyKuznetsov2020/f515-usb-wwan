@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="su.dsr.f515usbwwan"
     android:versionCode="19"
-    android:versionName="2.7.1-e8372">
+    android:versionName="2.8">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="29" />
 
