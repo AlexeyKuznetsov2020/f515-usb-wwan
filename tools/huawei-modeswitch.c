@@ -32,6 +32,7 @@
  * Запуск на голове: huawei-modeswitch [-n] [-w СЕК] [-m ХЕКС] [busid, например 2-1]
  *   -n       только показать, что найдено и что было бы сделано, ничего не отправлять
  *   -r       только поговорить с виртуальным CD-ROM модема (SCSI-диалог), не переключать
+ *   -c       только послать старый управляющий запрос HuaweiMode, ничего больше
  *   -w СЕК   сколько ждать нового PID после каждой команды (по умолчанию 20)
  *   -m ХЕКС  послать ровно это сообщение (62 hex-символа) и никакое другое —
  *            чтобы проверить чужой рецепт, не пересобирая бинарь
@@ -70,28 +71,62 @@ struct method {
 
 static const struct method methods[] = {
 	{
-		/* HuaweiNewMode (-J у usb_modeswitch): им переключается почти вся
-		 * серия E3372/E8372 по upstream-конфигу 12d1:1f01. */
-		"HuaweiNewMode (11 06 20 00 00 01)",
+		/* Вариант, которым переключается НАША голова (E3372, 14fe -> 1506).
+		 * Строго первым: он проверен на железе, и рабочий сценарий не должен
+		 * ходить длинной дорогой. Это не тот же байт-в-байт HuaweiNewMode, что
+		 * в upstream (см. следующий) — у него обнулён хвост профиля. */
+		"вариант E3372 (11 06 20 00 00 01)",
 		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
 		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
 		  0x06, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
 		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
 	},
 	{
-		/* Старый HuaweiMode (-H): то же семейство команд, но без хвоста
-		 * 20 00 00 01. Прошивки постарше понимают только его. */
-		"Huawei legacy (11 06)",
+		/* Настоящий HuaweiNewMode из исходников usb_modeswitch: строка
+		 * "55534243123456780000000000000011062000000101000100000000000000".
+		 * Она же — «HiLink 14db» в разборах E8372h. */
+		"HuaweiNewMode upstream (-> HiLink 14db)",
 		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
 		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
-		  0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		  0x06, 0x20, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01,
 		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
 	},
 	{
-		/* Обычный SCSI START STOP UNIT с LOEJ|START — «извлечь диск».
-		 * Не Huawei-специфика, а общий приём: часть свистков уходит из
-		 * CD-ROM-режима именно от него. Здесь честно заполнены длина
-		 * команды (6) и сама команда 1b 00 00 00 02 00. */
+		/* «Stick/NCM» для E8372h: целевой PID 155e. */
+		"NCM/stick (-> 155e)",
+		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
+		  0x06, 0x30, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+	},
+	{
+		/* RNDIS: bPcType=00 (Windows). Именно RNDIS видит Windows на E8372h. */
+		"RNDIS (bPcType=Windows)",
+		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
+		  0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+	},
+	{
+		/* Вариант из usb-mode.json OpenWrt: bPcType=30 (Gateway). */
+		"Gateway (bPcType=30, 01 00 01)",
+		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
+		  0x06, 0x30, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+	},
+	{
+		/* Старый PPP-режим. */
+		"old PPP (11 06 30 00 00 01)",
+		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
+		  0x06, 0x30, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+	},
+	{
+		/* Обычный SCSI START STOP UNIT с LOEJ|START — «извлечь диск». Не
+		 * Huawei-специфика, а общий приём; длина команды и сама команда
+		 * заполнены честно. */
 		"SCSI eject (1b 00 00 00 02 00)",
 		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
 		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x1b,
@@ -463,6 +498,47 @@ static int try_config_switch(const struct found *f, int cfg)
  *
  * @return bCSWStatus (0 — команда выполнена), либо -1 при ошибке обмена.
  */
+/*
+ * Старый HuaweiMode из usb_modeswitch: не bulk-команда, а УПРАВЛЯЮЩИЙ запрос.
+ *
+ *     libusb_control_transfer(devh, STANDARD|RECIPIENT_DEVICE|ENDPOINT_OUT,
+ *                             SET_FEATURE, 1, 0, buffer, 0, 1000)
+ *
+ * То есть обычный SET_FEATURE(DEVICE_REMOTE_WAKEUP) на устройство. У нас в
+ * таблице способов лежал «Huawei legacy», но он слал ту же идею bulk-сообщением
+ * — то есть был не тем методом вовсе. Транспорт здесь другой, и на модеме,
+ * который bulk-команду принимает и игнорирует, это единственный оставшийся
+ * канал, куда мы ещё не стучались.
+ */
+static int send_huawei_control(const struct found *f)
+{
+	struct usbdevfs_ctrltransfer ct;
+	int fd, rc;
+
+	fd = open(f->node, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "control: open %s: %s\n", f->node, strerror(errno));
+		return -1;
+	}
+	memset(&ct, 0, sizeof(ct));
+	ct.bRequestType = 0x00;  /* standard, recipient device, host-to-device */
+	ct.bRequest     = 0x03;  /* SET_FEATURE */
+	ct.wValue       = 0x0001;/* DEVICE_REMOTE_WAKEUP */
+	ct.wIndex       = 0;
+	ct.wLength      = 0;
+	ct.timeout      = 1000;
+	ct.data         = NULL;
+
+	rc = ioctl(fd, USBDEVFS_CONTROL, &ct);
+	if (rc < 0)
+		printf("control SET_FEATURE(1): %s (на удачном переключении это норма)\n",
+		       strerror(errno));
+	else
+		printf("control SET_FEATURE(1) отправлен\n");
+	close(fd);
+	return 0;
+}
+
 static uint32_t bot_tag = 0x12345678;
 
 static int bot_cmd(int fd, const struct found *f, const uint8_t *cmd, int cmdlen,
@@ -765,7 +841,7 @@ static int send_switch(const struct found *f, const uint8_t *msg)
 int main(int argc, char **argv)
 {
 	struct found f;
-	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0, probe_only = 0;
+	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0, probe_only = 0, ctrl_only = 0;
 	uint8_t custom[31];
 	char busid_arg[32] = "";
 
@@ -777,6 +853,8 @@ int main(int argc, char **argv)
 			dry_run = 1;
 		} else if (strcmp(argv[i], "-r") == 0) {
 			probe_only = 1;
+		} else if (strcmp(argv[i], "-c") == 0) {
+			ctrl_only = 1;
 		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
 			wait_secs = atoi(argv[++i]);
 			if (wait_secs < 1)
@@ -920,6 +998,15 @@ int main(int argc, char **argv)
 			fprintf(stderr, "unbind не удался, пробуем claim всё равно\n");
 		cdrom_probe(&f);
 	}
+	if (ctrl_only) {
+		send_huawei_control(&f);
+		if (wait_for_switch(f.busid, wait_secs) >= 0)
+			printf("переключился: PID стал %04x\n",
+			       (unsigned)sysfs_hex(f.busid, "idProduct"));
+		else
+			printf("PID не изменился за %d с\n", wait_secs);
+		return 0;
+	}
 	if (probe_only) {
 		printf("PID сейчас: %04x\n", (unsigned)sysfs_hex(f.busid, "idProduct"));
 		return 0;
@@ -984,6 +1071,20 @@ int main(int argc, char **argv)
 			pid = wait_for_switch(f.busid, wait_secs);
 			if (pid >= 0) {
 				printf("переключился: PID стал %04x\n", (unsigned)pid);
+				return 0;
+			}
+			printf("PID не изменился за %d с\n", wait_secs);
+		}
+	}
+
+	/* Последним — другой транспорт: управляющий запрос вместо bulk-команды. */
+	if (!custom_ok) {
+		printf("--- последний способ: управляющий запрос HuaweiMode\n");
+		if (resolve_node(&f) == 0) {
+			send_huawei_control(&f);
+			if (wait_for_switch(f.busid, wait_secs) >= 0) {
+				printf("переключился: PID стал %04x\n",
+				       (unsigned)sysfs_hex(f.busid, "idProduct"));
 				return 0;
 			}
 			printf("PID не изменился за %d с\n", wait_secs);
