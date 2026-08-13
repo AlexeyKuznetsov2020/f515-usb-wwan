@@ -96,11 +96,17 @@ public class Keeper {
      * проверить, что файл непустой - сверяем cmdline). Ожидание держит канал открытым
      * ровно столько, сколько потомку нужно, чтобы уйти в свою сессию, и заодно превращает
      * "started" из обещания в факт: в ответе виден pid.
+     *
+     * В boot-stdout.log уходит только stderr, а stdout - в /dev/null. Раньше туда шло всё,
+     * и каждая строка сторожа ложилась на флеш дважды: сначала log() пишет её в boot.log,
+     * потом та же строка приходит сюда через stdout. Смысл этого файла всегда был в другом -
+     * поймать то, что до boot.log не доходит вовсе (ошибки шелла, падение до открытия лога),
+     * а это как раз stderr.
      */
     private static String launchCmd(boolean now) {
         String pid = DIR + "/state/watchdog.pid";
         return "mkdir -p " + DIR + "/state; setsid sh " + BOOT + (now ? " --now" : "")
-                + " </dev/null >>" + DIR + "/state/boot-stdout.log 2>&1 &"
+                + " </dev/null >/dev/null 2>>" + DIR + "/state/boot-stdout.log &"
                 + " w=; i=0; while [ $i -lt 15 ]; do p=$(cat " + pid + " 2>/dev/null);"
                 + " if [ -n \"$p\" ] && grep -qs wwan-boot /proc/$p/cmdline; then w=$p; break; fi;"
                 + " sleep 1; i=$((i+1)); done;"

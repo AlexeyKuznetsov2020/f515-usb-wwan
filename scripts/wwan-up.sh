@@ -83,6 +83,27 @@ done
 # ---------------------------------------------------------------- вывод/логи --
 STAGE_NO=0
 
+# Логи только дописываются, а logrotate на голове нет — значит усекать надо самим.
+# Перевалил за LOG_MAX — оставляем последнюю половину: свежее всегда нужнее, а
+# резать ровно по границе значит резать каждую следующую строку.
+#
+# Именно `cat` в существующий файл, а не `mv` поверх: tbox.log держит открытым
+# живой процесс (tbox-icon.sh перенаправляет в него stdout tboxwire). Подмена
+# файла оставила бы его писать в отвязанный inode — место на флеше так и не
+# освободилось бы, а видимый файл замер бы навсегда. Перезапись того же inode
+# такой процесс переживает: он пишет с O_APPEND, то есть в новый конец.
+LOG_MAX=${WWAN_LOG_MAX:-5242880}
+log_trim() {
+	for _lt_f in "$@"; do
+		[ -f "$_lt_f" ] || continue
+		_lt_sz=$(stat -c %s "$_lt_f" 2>/dev/null) || continue
+		[ "$_lt_sz" -gt "$LOG_MAX" ] 2>/dev/null || continue
+		tail -c $((LOG_MAX / 2)) "$_lt_f" >"$_lt_f.trim" 2>/dev/null &&
+			cat "$_lt_f.trim" >"$_lt_f" 2>/dev/null
+		rm -f "$_lt_f.trim" 2>/dev/null
+	done
+}
+
 say()   { echo "$*"; echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null; }
 stage() {
 	STAGE_NO=$((STAGE_NO + 1))
@@ -547,6 +568,10 @@ if [ "$DO_DOWN" = 1 ]; then
 	say "   ip rule del oif ppp0 table $TABLE"
 	exit 0
 fi
+
+# Раз в запуск, до первой строки: заход добавляет пару килобайт, так что чаще
+# проверять нечего, а по одному stat на запуск не стоит ничего.
+log_trim "$LOG" "$PPP_LOG"
 
 say "=================================================================="
 say "wwan-up $(date '+%F %T')  APN=$APN  check=$CHECK_ONLY  system=$DO_SYSTEM boot=$BOOT_MODE"
