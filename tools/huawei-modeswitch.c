@@ -31,6 +31,7 @@
  * Сборка: tools/build-tools.sh (статически, aarch64).
  * Запуск на голове: huawei-modeswitch [-n] [-w СЕК] [-m ХЕКС] [busid, например 2-1]
  *   -n       только показать, что найдено и что было бы сделано, ничего не отправлять
+ *   -r       только поговорить с виртуальным CD-ROM модема (SCSI-диалог), не переключать
  *   -w СЕК   сколько ждать нового PID после каждой команды (по умолчанию 20)
  *   -m ХЕКС  послать ровно это сообщение (62 hex-символа) и никакое другое —
  *            чтобы проверить чужой рецепт, не пересобирая бинарь
@@ -114,6 +115,7 @@ struct found {
 	int      cfgval;   /* bConfigurationValue конфигурации со storage-интерфейсом */
 	int      ifnum;    /* mass-storage интерфейс (bInterfaceNumber) */
 	int      ep_out;   /* его bulk-OUT endpoint */
+	int      ep_in;    /* и bulk-IN: с него читается CSW, см. send_switch */
 	int      nconfigs; /* bNumConfigurations: больше одной — есть что переключать */
 	char     busid[32];  /* sysfs busid, например "2-1"; пусто, если найдено по devnode */
 	char     node[512];  /* /dev/bus/usb/BBB/DDD */
@@ -161,6 +163,7 @@ static int parse_descriptors(int fd, struct found *f)
 
 	f->ifnum = -1;
 	f->ep_out = -1;
+	f->ep_in = -1;
 	f->cfgval = 1; /* разумный дефолт для однoконфигурационных устройств */
 	f->nconfigs = 1;
 	f->dump[0] = '\0';
@@ -205,10 +208,13 @@ static int parse_descriptors(int fd, struct found *f)
 			dumpf(f, "      ep 0x%02x %s\n", addr,
 			      (attr & 0x03) == 0x02 ? "bulk" :
 			      (attr & 0x03) == 0x03 ? "interrupt" : "прочий");
-			/* bulk (attr&3==2) и направление OUT (бит 7 сброшен) */
-			if (in_storage_iface && (attr & 0x03) == 0x02 &&
-			    !(addr & 0x80) && f->ep_out < 0)
-				f->ep_out = addr;
+			/* bulk (attr&3==2), направление по биту 7 адреса */
+			if (in_storage_iface && (attr & 0x03) == 0x02) {
+				if (!(addr & 0x80) && f->ep_out < 0)
+					f->ep_out = addr;
+				else if ((addr & 0x80) && f->ep_in < 0)
+					f->ep_in = addr;
+			}
 		}
 		i += h->bLength;
 	}
@@ -446,6 +452,152 @@ static int try_config_switch(const struct found *f, int cfg)
 }
 
 /*
+ * Полноценная транзакция Bulk-Only Transport: CBW -> (данные) -> CSW.
+ *
+ * Нужна не ради самих данных, а ради того, чтобы поговорить с модемом ровно так,
+ * как это делает обычный хост. На голове с виртуальным CD-ROM свистка не общается
+ * НИКТО: в ядре нет sr_mod, LUN 0 перечисляется и остаётся нетронутым (устройства
+ * /dev/sr* не появляется вовсе), а usb-storage подхватывает только LUN 1 с картой
+ * памяти. Windows этот CD-ROM монтирует и читает — там лежит autorun с фирменными
+ * драйверами, — и вокруг этого чтения крутится весь сценарий переключения.
+ *
+ * @return bCSWStatus (0 — команда выполнена), либо -1 при ошибке обмена.
+ */
+static uint32_t bot_tag = 0x12345678;
+
+static int bot_cmd(int fd, const struct found *f, const uint8_t *cmd, int cmdlen,
+		   uint8_t lun, int dir_in, uint8_t *data, int datalen)
+{
+	struct usbdevfs_bulktransfer bt;
+	uint8_t cbw[31], csw[13];
+	int rc;
+
+	if (f->ep_in < 0 || f->ep_out < 0)
+		return -1;
+
+	memset(cbw, 0, sizeof(cbw));
+	memcpy(cbw, "USBC", 4);
+	bot_tag++;
+	cbw[4] = (uint8_t)(bot_tag);
+	cbw[5] = (uint8_t)(bot_tag >> 8);
+	cbw[6] = (uint8_t)(bot_tag >> 16);
+	cbw[7] = (uint8_t)(bot_tag >> 24);
+	cbw[8]  = (uint8_t)(datalen);
+	cbw[9]  = (uint8_t)(datalen >> 8);
+	cbw[10] = (uint8_t)(datalen >> 16);
+	cbw[11] = (uint8_t)(datalen >> 24);
+	cbw[12] = dir_in ? 0x80 : 0x00;
+	cbw[13] = lun;
+	cbw[14] = (uint8_t)cmdlen;
+	memcpy(cbw + 15, cmd, cmdlen > 16 ? 16 : cmdlen);
+
+	memset(&bt, 0, sizeof(bt));
+	bt.ep = (unsigned int)f->ep_out;
+	bt.len = sizeof(cbw);
+	bt.timeout = 3000;
+	bt.data = cbw;
+	if (ioctl(fd, USBDEVFS_BULK, &bt) < 0)
+		return -1;
+
+	if (datalen > 0 && data) {
+		memset(&bt, 0, sizeof(bt));
+		bt.ep = (unsigned int)(dir_in ? f->ep_in : f->ep_out);
+		bt.len = (unsigned int)datalen;
+		bt.timeout = 5000;
+		bt.data = data;
+		/* Короткий ответ и стоп на фазе данных — обычное дело, CSW всё скажет. */
+		ioctl(fd, USBDEVFS_BULK, &bt);
+	}
+
+	memset(&bt, 0, sizeof(bt));
+	memset(csw, 0, sizeof(csw));
+	bt.ep = (unsigned int)f->ep_in;
+	bt.len = sizeof(csw);
+	bt.timeout = 5000;
+	bt.data = csw;
+	rc = ioctl(fd, USBDEVFS_BULK, &bt);
+	if (rc < 13 || memcmp(csw, "USBS", 4) != 0)
+		return -1;
+	return csw[12];
+}
+
+/*
+ * Прикидываемся нормальным хостом для виртуального CD-ROM модема: спрашиваем
+ * готовность, представляемся, читаем размер и сам нулевой сектор. Именно этого
+ * общения свистку и не хватает на голове.
+ */
+static int cdrom_probe(const struct found *f)
+{
+	uint8_t inquiry[6] = { 0x12, 0, 0, 0, 36, 0 };
+	uint8_t tur[6]     = { 0x00, 0, 0, 0, 0, 0 };
+	uint8_t readcap[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	uint8_t read10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0 };
+	uint8_t buf[2048];
+	uint32_t blocks = 0, blksz = 0;
+	int fd, ifnum = f->ifnum, st, i;
+
+	fd = open(f->node, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "CD-ROM: open %s: %s\n", f->node, strerror(errno));
+		return -1;
+	}
+	if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifnum) < 0) {
+		fprintf(stderr, "CD-ROM: claim: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	/* Готовность спрашиваем несколько раз: первый ответ у CD-ROM почти всегда
+	 * "не готов, носитель менялся" — ровно так же его дёргает любой хост. */
+	for (i = 0; i < 5; i++) {
+		st = bot_cmd(fd, f, tur, sizeof(tur), 0, 0, NULL, 0);
+		printf("CD-ROM: TEST UNIT READY -> %d\n", st);
+		if (st == 0) break;
+		usleep(300000);
+	}
+
+	memset(buf, 0, sizeof(buf));
+	st = bot_cmd(fd, f, inquiry, sizeof(inquiry), 0, 1, buf, 36);
+	if (st == 0) {
+		char vendor[9], product[17];
+
+		memcpy(vendor, buf + 8, 8);  vendor[8] = '\0';
+		memcpy(product, buf + 16, 16); product[16] = '\0';
+		printf("CD-ROM: INQUIRY -> тип %02x, '%s' '%s'\n", buf[0] & 0x1f, vendor, product);
+	} else {
+		printf("CD-ROM: INQUIRY -> %d\n", st);
+	}
+
+	memset(buf, 0, sizeof(buf));
+	st = bot_cmd(fd, f, readcap, sizeof(readcap), 0, 1, buf, 8);
+	if (st == 0) {
+		blocks = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+			 ((uint32_t)buf[2] << 8) | buf[3];
+		blksz  = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
+			 ((uint32_t)buf[6] << 8) | buf[7];
+		printf("CD-ROM: READ CAPACITY -> %u блоков по %u байт\n", blocks, blksz);
+	} else {
+		printf("CD-ROM: READ CAPACITY -> %d\n", st);
+	}
+
+	if (blksz == 0 || blksz > sizeof(buf))
+		blksz = 2048;
+	memset(buf, 0, sizeof(buf));
+	st = bot_cmd(fd, f, read10, sizeof(read10), 0, 1, buf, (int)blksz);
+	printf("CD-ROM: READ(10) сектор 0 -> %d", st);
+	if (st == 0) {
+		printf(", первые байты:");
+		for (i = 0; i < 8; i++)
+			printf(" %02x", buf[i]);
+	}
+	printf("\n");
+
+	ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifnum);
+	close(fd);
+	return 0;
+}
+
+/*
  * USB-сброс порта: устройство отваливается и перечисляется заново, ядро само
  * прибинживает к нему usb-storage.
  *
@@ -570,6 +722,41 @@ static int send_switch(const struct found *f, const uint8_t *msg)
 	}
 	printf("отправлено %d байт в ep 0x%02x\n", transferred, f->ep_out);
 
+	/*
+	 * Дочитываем CSW. Bulk-Only Transport — это транзакция из двух шагов: хост
+	 * шлёт CBW и ОБЯЗАН забрать 13-байтовый статус со bulk-IN. Мы раньше уходили
+	 * сразу после записи, и прошивка вправе была считать транзакцию брошенной и
+	 * ничего не делать — ровно то, что наблюдалось на E8372h-153: байты приняты,
+	 * эффекта ноль. usb_modeswitch статус читает, и мы теперь тоже.
+	 *
+	 * Ошибка здесь ничего не отменяет: на удачном переключении модем отваливается
+	 * прямо в этот момент, и ENODEV — самый желанный исход.
+	 */
+	if (f->ep_in >= 0) {
+		struct usbdevfs_bulktransfer csw;
+		uint8_t buf[13];
+		int got;
+
+		memset(&csw, 0, sizeof(csw));
+		memset(buf, 0, sizeof(buf));
+		csw.ep = (unsigned int)f->ep_in;
+		csw.len = sizeof(buf);
+		csw.timeout = 3000;
+		csw.data = buf;
+
+		got = ioctl(fd, USBDEVFS_BULK, &csw);
+		if (got < 0) {
+			printf("CSW не прочитан (%s) — на удачном переключении это норма\n",
+			       strerror(errno));
+		} else if (got >= 13 && memcmp(buf, "USBS", 4) == 0) {
+			/* Последний байт CSW — bCSWStatus: 0 команда принята. */
+			printf("CSW: статус %d (%s)\n", buf[12],
+			       buf[12] == 0 ? "команда принята" : "команда отвергнута");
+		} else {
+			printf("CSW: %d байт, не похоже на статус\n", got);
+		}
+	}
+
 	ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifnum);
 	close(fd);
 	return 0;
@@ -578,7 +765,7 @@ static int send_switch(const struct found *f, const uint8_t *msg)
 int main(int argc, char **argv)
 {
 	struct found f;
-	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0;
+	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0, probe_only = 0;
 	uint8_t custom[31];
 	char busid_arg[32] = "";
 
@@ -588,6 +775,8 @@ int main(int argc, char **argv)
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-n") == 0) {
 			dry_run = 1;
+		} else if (strcmp(argv[i], "-r") == 0) {
+			probe_only = 1;
 		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
 			wait_secs = atoi(argv[++i]);
 			if (wait_secs < 1)
@@ -719,6 +908,21 @@ int main(int argc, char **argv)
 			if (reset_device(&f) == 0)
 				did_reset = 1;
 		}
+	}
+
+	/*
+	 * Прежде чем что-то переключать, ведём себя как обычный хост: читаем
+	 * виртуальный CD-ROM. На голове его не читает никто (нет sr_mod), и это
+	 * единственное заметное отличие от Windows, где свисток переключается сам.
+	 */
+	if (resolve_node(&f) == 0) {
+		if (unbind_if_needed(&f) != 0)
+			fprintf(stderr, "unbind не удался, пробуем claim всё равно\n");
+		cdrom_probe(&f);
+	}
+	if (probe_only) {
+		printf("PID сейчас: %04x\n", (unsigned)sysfs_hex(f.busid, "idProduct"));
+		return 0;
 	}
 
 	for (i = 0; i < (custom_ok ? 1 : N_METHODS); i++) {
