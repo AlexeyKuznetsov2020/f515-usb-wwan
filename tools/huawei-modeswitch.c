@@ -7,6 +7,14 @@
  * (/dev/bus/usb/BBB/DDD). После неё модем сам переподключается уже с новым PID,
  * поэтому ошибка на записи вида ENODEV/EIO — это НЕ сбой, а ожидаемый результат.
  *
+ * Команда не одна. Прошивки Huawei за годы разошлись, и та, что переключает E3372
+ * (12d1:14fe), молча игнорируется E8372h-153 (12d1:1f01): байты уходят, устройство
+ * не реагирует и остаётся флешкой. Поэтому способы перебираются по очереди, и после
+ * каждого мы ЖДЁМ и проверяем PID в sysfs — переподключение занимает секунды, а не
+ * мгновение (upstream usb_modeswitch держит для этих PID CheckSuccess=20).
+ * Если не помог ни один — печатаем полный разбор дескрипторов: без него по одному
+ * «не сработало» на чужой голове диагностировать нечего.
+ *
  * Перед этим интерфейс нужно по-настоящему освободить от usb-storage: одного
  * USBDEVFS_DISCONNECT (soft-disconnect на уровне usbfs) недостаточно — сразу после
  * enumerate() ядро может ещё гонять SCSI-команды (INQUIRY/READ CAPACITY) в отдельном
@@ -15,12 +23,16 @@
  * (/sys/bus/usb/drivers/usb-storage/unbind), с ожиданием, что драйвер правда отвалился.
  *
  * Сборка: tools/build-tools.sh (статически, aarch64).
- * Запуск на голове: huawei-modeswitch [-n] [busid, например 2-1]
- *   -n   только показать, что найдено и что было бы сделано, ничего не отправлять
+ * Запуск на голове: huawei-modeswitch [-n] [-w СЕК] [-m ХЕКС] [busid, например 2-1]
+ *   -n       только показать, что найдено и что было бы сделано, ничего не отправлять
+ *   -w СЕК   сколько ждать нового PID после каждой команды (по умолчанию 20)
+ *   -m ХЕКС  послать ровно это сообщение (62 hex-символа) и никакое другое —
+ *            чтобы проверить чужой рецепт, не пересобирая бинарь
  */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,15 +50,50 @@
 static const uint16_t storage_pids[] = { 0x14fe, 0x1f01, 0x1f02, 0x1446, 0x14ad, 0x1c0b };
 
 /*
- * Сообщение из upstream-конфига usb_modeswitch для Huawei (TargetProduct=0x1506).
- * Это стандартный CBW: signature "USBC", tag, длина, флаги + SCSI-команда 0x11 0x06.
+ * Способы переключения, по порядку. Все три — стандартный CBW: signature "USBC",
+ * tag, длина передачи, флаги, длина команды и сама SCSI-команда.
+ *
+ * Первым идёт тот, что работает на нашей голове (E3372, 14fe -> 1506): менять
+ * порядок нельзя, иначе рабочий сценарий начнёт ходить длинной дорогой.
  */
-static const uint8_t switch_msg[31] = {
-	0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
-	0x06, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+struct method {
+	const char *name;
+	uint8_t     msg[31];
 };
+
+static const struct method methods[] = {
+	{
+		/* HuaweiNewMode (-J у usb_modeswitch): им переключается почти вся
+		 * серия E3372/E8372 по upstream-конфигу 12d1:1f01. */
+		"HuaweiNewMode (11 06 20 00 00 01)",
+		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
+		  0x06, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+	},
+	{
+		/* Старый HuaweiMode (-H): то же семейство команд, но без хвоста
+		 * 20 00 00 01. Прошивки постарше понимают только его. */
+		"Huawei legacy (11 06)",
+		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
+		  0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+	},
+	{
+		/* Обычный SCSI START STOP UNIT с LOEJ|START — «извлечь диск».
+		 * Не Huawei-специфика, а общий приём: часть свистков уходит из
+		 * CD-ROM-режима именно от него. Здесь честно заполнены длина
+		 * команды (6) и сама команда 1b 00 00 00 02 00. */
+		"SCSI eject (1b 00 00 00 02 00)",
+		{ 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x1b,
+		  0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+		  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+	}
+};
+
+#define N_METHODS ((int)(sizeof(methods) / sizeof(methods[0])))
 
 /* Дескрипторы разбираем сами, чтобы не тянуть linux/usb/ch9.h из чужого sysroot. */
 struct desc_hdr { uint8_t bLength; uint8_t bDescriptorType; };
@@ -58,11 +105,13 @@ struct desc_hdr { uint8_t bLength; uint8_t bDescriptorType; };
 
 struct found {
 	uint16_t vid, pid;
-	int      cfgval;  /* bConfigurationValue (обычно 1) */
-	int      ifnum;   /* mass-storage интерфейс (bInterfaceNumber) */
-	int      ep_out;  /* его bulk-OUT endpoint */
+	int      cfgval;   /* bConfigurationValue конфигурации со storage-интерфейсом */
+	int      ifnum;    /* mass-storage интерфейс (bInterfaceNumber) */
+	int      ep_out;   /* его bulk-OUT endpoint */
+	int      nconfigs; /* bNumConfigurations: больше одной — есть что переключать */
 	char     busid[32];  /* sysfs busid, например "2-1"; пусто, если найдено по devnode */
 	char     node[512];  /* /dev/bus/usb/BBB/DDD */
+	char     dump[2048]; /* разбор дескрипторов — печатаем, только если всё провалилось */
 };
 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -81,12 +130,25 @@ static int is_storage_pid(uint16_t pid)
  * Идём по ним линейно и запоминаем bConfigurationValue, первый mass-storage
  * интерфейс (класс 0x08) и его bulk-OUT endpoint.
  */
+static void dumpf(struct found *f, const char *fmt, ...)
+{
+	va_list ap;
+	size_t len = strlen(f->dump);
+
+	if (len + 1 >= sizeof(f->dump))
+		return;
+	va_start(ap, fmt);
+	vsnprintf(f->dump + len, sizeof(f->dump) - len, fmt, ap);
+	va_end(ap);
+}
+
 static int parse_descriptors(int fd, struct found *f)
 {
 	uint8_t buf[4096];
 	ssize_t n = read(fd, buf, sizeof(buf));
 	ssize_t i = 0;
 	int in_storage_iface = 0;
+	int cur_cfg = 1;
 
 	if (n < 18)
 		return -1;
@@ -94,6 +156,8 @@ static int parse_descriptors(int fd, struct found *f)
 	f->ifnum = -1;
 	f->ep_out = -1;
 	f->cfgval = 1; /* разумный дефолт для однoконфигурационных устройств */
+	f->nconfigs = 1;
+	f->dump[0] = '\0';
 
 	while (i + 2 <= n) {
 		const struct desc_hdr *h = (const struct desc_hdr *)(buf + i);
@@ -104,19 +168,37 @@ static int parse_descriptors(int fd, struct found *f)
 		if (h->bDescriptorType == DT_DEVICE && h->bLength >= 18) {
 			f->vid = le16(buf + i + 8);
 			f->pid = le16(buf + i + 10);
+			f->nconfigs = buf[i + 17];
+			dumpf(f, "  устройство %04x:%04x, конфигураций: %d\n",
+			      f->vid, f->pid, f->nconfigs);
 		} else if (h->bDescriptorType == DT_CONFIG && h->bLength >= 6) {
-			f->cfgval = buf[i + 5];
+			/*
+			 * cfgval нужен для пути вида "2-1:1.0", то есть это номер той
+			 * конфигурации, в которой лежит storage-интерфейс, а не последней
+			 * встреченной. Раньше он перетирался каждым CONFIG-дескриптором:
+			 * на многоконфигурационном устройстве unbind шёл бы по
+			 * несуществующему пути и молча не делал ничего.
+			 */
+			cur_cfg = buf[i + 5];
+			dumpf(f, "  конфигурация %d: интерфейсов %d\n", cur_cfg, buf[i + 4]);
 		} else if (h->bDescriptorType == DT_INTERFACE && h->bLength >= 9) {
 			uint8_t ifnum = buf[i + 2];
 			uint8_t iclass = buf[i + 5];
 
+			dumpf(f, "    интерфейс %d alt %d: класс %02x/%02x/%02x\n",
+			      ifnum, buf[i + 3], iclass, buf[i + 6], buf[i + 7]);
 			in_storage_iface = (iclass == 0x08);
-			if (in_storage_iface && f->ifnum < 0)
+			if (in_storage_iface && f->ifnum < 0) {
 				f->ifnum = ifnum;
+				f->cfgval = cur_cfg;
+			}
 		} else if (h->bDescriptorType == DT_ENDPOINT && h->bLength >= 7) {
 			uint8_t addr = buf[i + 2];
 			uint8_t attr = buf[i + 3];
 
+			dumpf(f, "      ep 0x%02x %s\n", addr,
+			      (attr & 0x03) == 0x02 ? "bulk" :
+			      (attr & 0x03) == 0x03 ? "interrupt" : "прочий");
 			/* bulk (attr&3==2) и направление OUT (бит 7 сброшен) */
 			if (in_storage_iface && (attr & 0x03) == 0x02 &&
 			    !(addr & 0x80) && f->ep_out < 0)
@@ -265,7 +347,99 @@ static int unbind_if_needed(const struct found *f)
 	return 0;
 }
 
-static int send_switch(const struct found *f)
+/* Читает одно шестнадцатеричное поле устройства из sysfs; -1, если устройства нет. */
+static int sysfs_hex(const char *busid, const char *attr)
+{
+	char path[300], line[64];
+	FILE *fp;
+	int v = -1;
+
+	snprintf(path, sizeof(path), "%s/%s/%s", SYSFS_USB_DEVICES, busid, attr);
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+	if (fgets(line, sizeof(line), fp))
+		v = (int)strtoul(line, NULL, 16);
+	fclose(fp);
+	return v;
+}
+
+/* Пересчитывает /dev/bus/usb/BBB/DDD: после переподключения devnum меняется. */
+static int resolve_node(struct found *f)
+{
+	char path[300], line[64];
+	FILE *fp;
+	unsigned busnum = 0, devnum = 0;
+
+	snprintf(path, sizeof(path), "%s/%s/busnum", SYSFS_USB_DEVICES, f->busid);
+	fp = fopen(path, "r");
+	if (fp) { if (fgets(line, sizeof(line), fp)) busnum = (unsigned)strtoul(line, NULL, 10); fclose(fp); }
+	snprintf(path, sizeof(path), "%s/%s/devnum", SYSFS_USB_DEVICES, f->busid);
+	fp = fopen(path, "r");
+	if (fp) { if (fgets(line, sizeof(line), fp)) devnum = (unsigned)strtoul(line, NULL, 10); fclose(fp); }
+	if (!busnum || !devnum)
+		return -1;
+	snprintf(f->node, sizeof(f->node), "/dev/bus/usb/%03u/%03u", busnum, devnum);
+	return 0;
+}
+
+/*
+ * Ждём, пока модем вернётся на шину с НЕ-storage PID.
+ *
+ * Проверять сразу после команды бессмысленно: устройство сначала отваливается,
+ * потом заново перечисляется, и всё это занимает секунды — у upstream
+ * usb_modeswitch для этих же PID стоит CheckSuccess=20. Пропажа каталога в sysfs
+ * тоже не ответ: это середина переподключения, надо дождаться возвращения.
+ *
+ * Возвращает новый PID, или -1, если за отведённое время ничего не изменилось.
+ */
+static int wait_for_switch(const char *busid, int secs)
+{
+	int i, gone = 0;
+
+	for (i = 0; i < secs * 10; i++) {
+		int pid = sysfs_hex(busid, "idProduct");
+
+		if (pid < 0) {
+			gone = 1;          /* переподключается — это хороший знак */
+		} else if (!is_storage_pid((uint16_t)pid)) {
+			return pid;
+		} else if (gone) {
+			/* Вернулся — и снова флешкой. Способ не сработал. */
+			return -1;
+		}
+		usleep(100000);
+	}
+	return -1;
+}
+
+/*
+ * Переключение сменой конфигурации USB. Не Huawei-специфика: если устройство
+ * заявляет больше одной конфигурации, «рабочая» может быть просто второй, и
+ * никакие SCSI-команды для этого не нужны. Ядро само переберёт драйверы заново.
+ */
+static int try_config_switch(const struct found *f, int cfg)
+{
+	char path[300], val[16];
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/%s/bConfigurationValue", SYSFS_USB_DEVICES, f->busid);
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	snprintf(val, sizeof(val), "%d", cfg);
+	if (write(fd, val, strlen(val)) < 0) {
+		fprintf(stderr, "запись cfg %d: %s\n", cfg, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+
+static int send_switch(const struct found *f, const uint8_t *msg)
 {
 	struct usbdevfs_ioctl detach;
 	struct usbdevfs_bulktransfer bulk;
@@ -296,9 +470,9 @@ static int send_switch(const struct found *f)
 
 	memset(&bulk, 0, sizeof(bulk));
 	bulk.ep = (unsigned int)f->ep_out;
-	bulk.len = sizeof(switch_msg);
+	bulk.len = 31;
 	bulk.timeout = 3000;
-	bulk.data = (void *)switch_msg;
+	bulk.data = (void *)msg;
 
 	transferred = ioctl(fd, USBDEVFS_BULK, &bulk);
 	if (transferred < 0) {
@@ -320,16 +494,43 @@ static int send_switch(const struct found *f)
 int main(int argc, char **argv)
 {
 	struct found f;
-	int dry_run = 0, i;
+	int dry_run = 0, i, wait_secs = 20, custom_ok = 0;
+	uint8_t custom[31];
 	char busid_arg[32] = "";
 
 	memset(&f, 0, sizeof(f));
+	memset(custom, 0, sizeof(custom));
 
 	for (i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "-n") == 0)
+		if (strcmp(argv[i], "-n") == 0) {
 			dry_run = 1;
-		else
+		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+			wait_secs = atoi(argv[++i]);
+			if (wait_secs < 1)
+				wait_secs = 1;
+		} else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+			const char *h = argv[++i];
+			int k;
+
+			if (strlen(h) != 62) {
+				fprintf(stderr, "-m: нужно ровно 62 hex-символа (31 байт), а не %zu\n",
+					strlen(h));
+				return 1;
+			}
+			for (k = 0; k < 31; k++) {
+				char pair[3] = { h[k * 2], h[k * 2 + 1], '\0' };
+				char *end;
+
+				custom[k] = (uint8_t)strtoul(pair, &end, 16);
+				if (*end) {
+					fprintf(stderr, "-m: '%s' — не hex\n", pair);
+					return 1;
+				}
+			}
+			custom_ok = 1;
+		} else {
 			snprintf(busid_arg, sizeof(busid_arg), "%s", argv[i]);
+		}
 	}
 
 	if (busid_arg[0]) {
@@ -360,6 +561,7 @@ int main(int argc, char **argv)
 		}
 		if (parse_descriptors(fd, &f) != 0) {
 			fprintf(stderr, "%s: mass-storage интерфейс не найден\n", f.node);
+			fprintf(stderr, "%s", f.dump);
 			close(fd);
 			return 2;
 		}
@@ -379,6 +581,7 @@ int main(int argc, char **argv)
 		}
 		if (parse_descriptors(fd, &f) != 0) {
 			fprintf(stderr, "%s: mass-storage интерфейс не найден\n", f.node);
+			fprintf(stderr, "%s", f.dump);
 			close(fd);
 			return 2;
 		}
@@ -405,11 +608,72 @@ int main(int argc, char **argv)
 
 	if (dry_run) {
 		printf("dry-run: unbind/команда не выполняются\n");
+		printf("%s", f.dump);
 		return 0;
 	}
 
-	if (unbind_if_needed(&f) != 0)
-		fprintf(stderr, "unbind не удался, пробуем claim всё равно (может не сработать)\n");
+	if (f.busid[0] == '\0') {
+		/*
+		 * Без busid проверять результат нечем (sysfs-путь неизвестен), так что
+		 * остаётся старое поведение: одна команда вслепую.
+		 */
+		if (unbind_if_needed(&f) != 0)
+			fprintf(stderr, "unbind не удался, пробуем claim всё равно\n");
+		return send_switch(&f, custom_ok ? custom : methods[0].msg);
+	}
 
-	return send_switch(&f);
+	for (i = 0; i < (custom_ok ? 1 : N_METHODS); i++) {
+		const uint8_t *msg = custom_ok ? custom : methods[i].msg;
+		int pid;
+
+		printf("--- способ %d: %s\n", i + 1,
+		       custom_ok ? "сообщение из -m" : methods[i].name);
+
+		/* devnum мог смениться, если модем переподключился от прошлой попытки. */
+		if (resolve_node(&f) != 0) {
+			fprintf(stderr, "%s пропал с шины\n", f.busid);
+			return 2;
+		}
+		if (unbind_if_needed(&f) != 0)
+			fprintf(stderr, "unbind не удался, пробуем claim всё равно\n");
+		if (send_switch(&f, msg) != 0)
+			continue;
+
+		pid = wait_for_switch(f.busid, wait_secs);
+		if (pid >= 0) {
+			printf("переключился: PID стал %04x\n", (unsigned)pid);
+			return 0;
+		}
+		printf("PID не изменился за %d с\n", wait_secs);
+	}
+
+	/*
+	 * Отдельным заходом, уже после всех SCSI-команд: смена конфигурации меняет
+	 * состояние устройства сильнее прочего, и начинать с неё не стоит.
+	 */
+	if (!custom_ok && f.nconfigs > 1) {
+		int cfg;
+
+		for (cfg = 1; cfg <= f.nconfigs; cfg++) {
+			int pid;
+
+			if (cfg == f.cfgval)
+				continue;
+			printf("--- способ %d: конфигурация USB %d из %d\n",
+			       N_METHODS + cfg, cfg, f.nconfigs);
+			if (try_config_switch(&f, cfg) != 0)
+				continue;
+			pid = wait_for_switch(f.busid, wait_secs);
+			if (pid >= 0) {
+				printf("переключился: PID стал %04x\n", (unsigned)pid);
+				return 0;
+			}
+			printf("PID не изменился за %d с\n", wait_secs);
+		}
+	}
+
+	fprintf(stderr, "ни один способ не сработал, модем остался в storage-режиме\n");
+	fprintf(stderr, "разбор дескрипторов (пришли эти строки — по ним видно, что за режим):\n");
+	fprintf(stderr, "%s", f.dump);
+	return 4;
 }

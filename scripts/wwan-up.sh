@@ -358,6 +358,16 @@ wifi_priority() {
 }
 
 # Каталог модема в sysfs + его VID/PID (Huawei-семейство).
+# PID'ы, в которых Huawei притворяется флешкой/CD-ROM и рабочих интерфейсов не
+# отдаёт. Тот же список зашит в tools/huawei-modeswitch.c — если правишь здесь,
+# правь и там.
+is_storage_pid() {
+	case "$1" in
+	14fe | 1f01 | 1f02 | 1446 | 14ad | 1c0b) return 0 ;;
+	esac
+	return 1
+}
+
 find_usb_dev() {
 	for d in /sys/bus/usb/devices/*; do
 		[ -f "$d/idVendor" ] || continue
@@ -621,14 +631,19 @@ if ! find_usb_dev; then
 	skip "Huawei (12d1:*) на шине нет — переключать нечего"
 else
 	MODESWITCH=${WWAN_MODESWITCH:-$(mod_dir huawei-modeswitch)/huawei-modeswitch}
-	case "$USB_PID" in
-	1506 | 1465 | 140c | 1c05 | 14ac) ok "режим с рабочими интерфейсами" ;;
-	14fe | 1f01 | 1f02 | 1446 | 14ad | 1c0b)
+	if is_storage_pid "$USB_PID"; then
 		NEED_SWITCH=1
-		warn "модем в storage-режиме — нужен modeswitch" ;;
-	*)
-		warn "PID $USB_PID незнакомый — пробуем как есть" ;;
-	esac
+		warn "модем в storage-режиме — нужен modeswitch"
+	else
+		case "$USB_PID" in
+		# AT/PPP-режимы.
+		1506 | 1465 | 140c | 1c05 | 14ac) ok "режим с рабочими интерфейсами" ;;
+		# HiLink: модем отдаёт себя сетевой картой (NCM/RNDIS), а не портами.
+		# E8372h-153 и E3372h-153 после переключения приходят именно сюда, в 14dc.
+		14db | 14dc | 1442 | 1c1e | 155e) ok "HiLink-режим ($USB_PID) — сетевой интерфейс" ;;
+		*) warn "PID $USB_PID незнакомый — пробуем как есть" ;;
+		esac
+	fi
 
 	if [ "$NEED_SWITCH" = 0 ]; then
 		skip "modeswitch не требуется"
@@ -640,20 +655,28 @@ else
 			say "   [dry ] $MODESWITCH"
 		else
 			"$MODESWITCH" 2>&1 | while read -r l; do say "   $l"; done
-			# Модем переподключается с новым PID — ждём появления.
+			# Ждём нового PID. Раньше здесь стояло `[ "$USB_PID" != "14fe" ]`:
+			# для 14fe (E3372) двадцать секунд отрабатывали как надо, а любой
+			# другой storage-PID — 1f01 у E8372h-153, например — выходил из
+			# цикла на ПЕРВОЙ же секунде и получал «modeswitch не сработал» ещё
+			# до того, как модем успевал переподключиться. Проверять надо весь
+			# набор storage-режимов, а не один PID.
+			#
+			# Сам modeswitch тоже ждёт после каждой своей попытки, так что сюда
+			# мы приходим уже с результатом; этот цикл — на случай, когда модем
+			# доезжает до нового PID чуть позже, чем инструмент сдался.
 			i=0
 			while [ $i -lt 20 ]; do
+				if find_usb_dev && ! is_storage_pid "$USB_PID"; then break; fi
 				sleep 1
-				if find_usb_dev && [ "$USB_PID" != "14fe" ]; then break; fi
 				i=$((i + 1))
 			done
 			find_usb_dev || die "после modeswitch модем пропал с шины" \
 				"вытащить и вставить модем, затем запустить скрипт заново"
-			case "$USB_PID" in
-			14fe | 1f01 | 1f02 | 1446 | 14ad | 1c0b)
+			if is_storage_pid "$USB_PID"; then
 				die "modeswitch не сработал, PID остался $USB_PID" \
-					"проверь, что ядро не держит usb-storage, и попробуй ещё раз" ;;
-			esac
+					"пришли строки разбора дескрипторов выше — по ним видно режим"
+			fi
 			ok "переключён в $USB_VID:$USB_PID"
 		fi
 	fi
