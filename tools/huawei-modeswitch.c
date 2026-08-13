@@ -38,6 +38,8 @@
  *   -w СЕК   сколько ждать нового PID после каждой команды (по умолчанию 20)
  *   -m ХЕКС  послать ровно это сообщение (62 hex-символа) и никакое другое —
  *            чтобы проверить чужой рецепт, не пересобирая бинарь
+ *   -x Т,З,V,I,L  произвольный управляющий запрос (всё в hex)
+ *   -D ХЕКС  полезная нагрузка к -x; без неё шлются нули нужной длины
  */
 #include <dirent.h>
 #include <errno.h>
@@ -943,6 +945,8 @@ int main(int argc, char **argv)
 	struct found f;
 	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0, probe_only = 0, ctrl_only = 0, win_only = 0, xctl = 0;
 	unsigned xt = 0, xr = 0, xv = 0, xi = 0, xl = 0;
+	uint8_t xdata[512];
+	int xdata_len = 0;
 	uint8_t custom[31];
 	char busid_arg[32] = "";
 
@@ -958,6 +962,27 @@ int main(int argc, char **argv)
 			ctrl_only = 1;
 		} else if (strcmp(argv[i], "-W") == 0) {
 			win_only = 1;
+		} else if (strcmp(argv[i], "-D") == 0 && i + 1 < argc) {
+			/* Полезная нагрузка для -x: hex-строка любой длины. */
+			const char *h = argv[++i];
+			size_t k, n = strlen(h) / 2;
+
+			if (strlen(h) % 2 || n > sizeof(xdata)) {
+				fprintf(stderr, "-D: нужна hex-строка чётной длины, не длиннее %zu байт\n",
+					sizeof(xdata));
+				return 1;
+			}
+			for (k = 0; k < n; k++) {
+				char pair[3] = { h[k * 2], h[k * 2 + 1], '\0' };
+				char *end;
+
+				xdata[k] = (uint8_t)strtoul(pair, &end, 16);
+				if (*end) {
+					fprintf(stderr, "-D: '%s' — не hex\n", pair);
+					return 1;
+				}
+			}
+			xdata_len = (int)n;
 		} else if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) {
 			/* -x тип,запрос,value,index,len — произвольный управляющий запрос
 			 * в hex, чтобы перебирать чужие рецепты без пересборки. */
@@ -1114,6 +1139,12 @@ int main(int argc, char **argv)
 		int fd2, n2;
 
 		memset(xbuf, 0, sizeof(xbuf));
+		if (xdata_len > 0) {
+			memcpy(xbuf, xdata, (size_t)xdata_len);
+			if (xl == 0)
+				xl = (unsigned)xdata_len;
+			printf("данные (%d байт) из -D\n", xdata_len);
+		}
 		fd2 = open(f.node, O_RDWR);
 		if (fd2 < 0) {
 			fprintf(stderr, "open %s: %s\n", f.node, strerror(errno));
