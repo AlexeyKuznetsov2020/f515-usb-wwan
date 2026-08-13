@@ -33,6 +33,8 @@
  *   -n       только показать, что найдено и что было бы сделано, ничего не отправлять
  *   -r       только поговорить с виртуальным CD-ROM модема (SCSI-диалог), не переключать
  *   -c       только послать старый управляющий запрос HuaweiMode, ничего больше
+ *   -W       прикинуться Windows: запросить MS OS String Descriptor (0xEE) и
+ *            Extended Compat ID — по ним прошивка Huawei и опознаёт хост
  *   -w СЕК   сколько ждать нового PID после каждой команды (по умолчанию 20)
  *   -m ХЕКС  послать ровно это сообщение (62 hex-символа) и никакое другое —
  *            чтобы проверить чужой рецепт, не пересобирая бинарь
@@ -539,6 +541,104 @@ static int send_huawei_control(const struct found *f)
 	return 0;
 }
 
+/*
+ * Прикидываемся Windows.
+ *
+ * Прошивка E8372h (и родственных Balong) сама определяет операционную систему по
+ * тому, какие стандартные USB-запросы делает хост, и уже сама выбирает, чем себя
+ * показать: Windows видит Remote NDIS, а Linux/Android — только CD-ROM с
+ * «драйверами». Команду переключения такое устройство принимает со статусом
+ * «выполнено» и не исполняет — решение принимается не по ней.
+ *
+ * Отличает Windows ровно один запрос: строковый дескриптор с индексом 0xEE,
+ * Microsoft OS String Descriptor. Его запрашивает только Windows, Linux и Android
+ * не делают этого никогда. В ответе лежит подпись "MSFT100" и байт bMS_VendorCode,
+ * которым дальше запрашиваются Extended Compat ID (wIndex=4) и Extended Properties
+ * (wIndex=5) — именно по ним Windows понимает, что устройству нужен RNDIS.
+ *
+ * Повторяем всю эту последовательность целиком.
+ */
+static int ctrl_in(int fd, uint8_t type, uint8_t req, uint16_t val, uint16_t idx,
+		   uint8_t *buf, uint16_t len)
+{
+	struct usbdevfs_ctrltransfer ct;
+
+	memset(&ct, 0, sizeof(ct));
+	ct.bRequestType = type;
+	ct.bRequest     = req;
+	ct.wValue       = val;
+	ct.wIndex       = idx;
+	ct.wLength      = len;
+	ct.timeout      = 3000;
+	ct.data         = buf;
+	return ioctl(fd, USBDEVFS_CONTROL, &ct);
+}
+
+static void hexline(const char *what, const uint8_t *b, int n)
+{
+	int i;
+
+	printf("%s (%d):", what, n);
+	for (i = 0; i < n && i < 24; i++)
+		printf(" %02x", b[i]);
+	printf("\n");
+}
+
+static int pretend_windows(const struct found *f)
+{
+	uint8_t buf[256];
+	int fd, n, vendor_code;
+
+	fd = open(f->node, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "MS OS: open %s: %s\n", f->node, strerror(errno));
+		return -1;
+	}
+
+	/* GET_DESCRIPTOR(STRING, index 0xEE) — «а я Windows». */
+	memset(buf, 0, sizeof(buf));
+	n = ctrl_in(fd, 0x80, 0x06, 0x03EE, 0x0000, buf, 18);
+	if (n < 0) {
+		printf("MS OS string 0xEE: %s — устройство его не отдаёт\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	hexline("MS OS string 0xEE", buf, n);
+
+	/* Подпись "MSFT100" в UTF-16 лежит с 2-го байта, vendor code — 16-й. */
+	if (n < 18 || buf[2] != 'M' || buf[4] != 'S' || buf[6] != 'F') {
+		printf("подписи MSFT100 нет — дальше идти некуда\n");
+		close(fd);
+		return -1;
+	}
+	vendor_code = buf[16];
+	printf("подпись MSFT100 есть, bMS_VendorCode = 0x%02x\n", vendor_code);
+
+	/* Extended Compat ID: сначала заголовок, потом всё целиком. */
+	memset(buf, 0, sizeof(buf));
+	n = ctrl_in(fd, 0xC0, (uint8_t)vendor_code, 0x0000, 0x0004, buf, 16);
+	if (n > 0) {
+		hexline("Extended Compat ID (заголовок)", buf, n);
+		memset(buf, 0, sizeof(buf));
+		n = ctrl_in(fd, 0xC0, (uint8_t)vendor_code, 0x0000, 0x0004, buf, 0x28);
+		if (n > 0)
+			hexline("Extended Compat ID", buf, n);
+	} else {
+		printf("Extended Compat ID: %s\n", strerror(errno));
+	}
+
+	/* Extended Properties — Windows спрашивает и его. */
+	memset(buf, 0, sizeof(buf));
+	n = ctrl_in(fd, 0xC0, (uint8_t)vendor_code, 0x0000, 0x0005, buf, 16);
+	if (n > 0)
+		hexline("Extended Properties", buf, n);
+	else
+		printf("Extended Properties: %s\n", strerror(errno));
+
+	close(fd);
+	return 0;
+}
+
 static uint32_t bot_tag = 0x12345678;
 
 static int bot_cmd(int fd, const struct found *f, const uint8_t *cmd, int cmdlen,
@@ -841,7 +941,8 @@ static int send_switch(const struct found *f, const uint8_t *msg)
 int main(int argc, char **argv)
 {
 	struct found f;
-	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0, probe_only = 0, ctrl_only = 0;
+	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0, probe_only = 0, ctrl_only = 0, win_only = 0, xctl = 0;
+	unsigned xt = 0, xr = 0, xv = 0, xi = 0, xl = 0;
 	uint8_t custom[31];
 	char busid_arg[32] = "";
 
@@ -855,6 +956,16 @@ int main(int argc, char **argv)
 			probe_only = 1;
 		} else if (strcmp(argv[i], "-c") == 0) {
 			ctrl_only = 1;
+		} else if (strcmp(argv[i], "-W") == 0) {
+			win_only = 1;
+		} else if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) {
+			/* -x тип,запрос,value,index,len — произвольный управляющий запрос
+			 * в hex, чтобы перебирать чужие рецепты без пересборки. */
+			if (sscanf(argv[++i], "%x,%x,%x,%x,%x", &xt, &xr, &xv, &xi, &xl) != 5) {
+				fprintf(stderr, "-x: нужно тип,запрос,value,index,len в hex\n");
+				return 1;
+			}
+			xctl = 1;
 		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
 			wait_secs = atoi(argv[++i]);
 			if (wait_secs < 1)
@@ -997,6 +1108,34 @@ int main(int argc, char **argv)
 		if (unbind_if_needed(&f) != 0)
 			fprintf(stderr, "unbind не удался, пробуем claim всё равно\n");
 		cdrom_probe(&f);
+	}
+	if (xctl) {
+		uint8_t xbuf[512];
+		int fd2, n2;
+
+		memset(xbuf, 0, sizeof(xbuf));
+		fd2 = open(f.node, O_RDWR);
+		if (fd2 < 0) {
+			fprintf(stderr, "open %s: %s\n", f.node, strerror(errno));
+			return 1;
+		}
+		n2 = ctrl_in(fd2, (uint8_t)xt, (uint8_t)xr, (uint16_t)xv, (uint16_t)xi,
+			     xbuf, (uint16_t)(xl > sizeof(xbuf) ? sizeof(xbuf) : xl));
+		if (n2 < 0)
+			printf("ответ: %s\n", strerror(errno));
+		else
+			hexline("ответ", xbuf, n2);
+		close(fd2);
+		return 0;
+	}
+	if (win_only) {
+		pretend_windows(&f);
+		if (wait_for_switch(f.busid, wait_secs) >= 0)
+			printf("переключился: PID стал %04x\n",
+			       (unsigned)sysfs_hex(f.busid, "idProduct"));
+		else
+			printf("PID не изменился за %d с\n", wait_secs);
+		return 0;
 	}
 	if (ctrl_only) {
 		send_huawei_control(&f);
