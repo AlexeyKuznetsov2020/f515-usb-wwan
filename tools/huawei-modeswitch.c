@@ -35,6 +35,8 @@
  *   -c       только послать старый управляющий запрос HuaweiMode, ничего больше
  *   -W       прикинуться Windows: запросить MS OS String Descriptor (0xEE) и
  *            Extended Compat ID — по ним прошивка Huawei и опознаёт хост
+ *   -t [БИАС] послать SC_WIN_SYS — то же, чем представляется драйвер Huawei
+ *            на Windows: пояс (минуты, UTC+3 = -180) и текущее время UTC
  *   -w СЕК   сколько ждать нового PID после каждой команды (по умолчанию 20)
  *   -m ХЕКС  послать ровно это сообщение (62 hex-символа) и никакое другое —
  *            чтобы проверить чужой рецепт, не пересобирая бинарь
@@ -50,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <linux/usbdevice_fs.h>
@@ -641,6 +644,79 @@ static int pretend_windows(const struct found *f)
 	return 0;
 }
 
+/*
+ * SC_WIN_SYS — то, чем драйвер Huawei на Windows представляется модему.
+ *
+ * Вытащено из USBPcap-дампа реальной машины: вендорский control-запрос
+ * bmRequestType=0x40, bRequest=0xA2, wValue=0, wIndex=0 и 20 байт данных.
+ * Содержимое оказалось не магической константой, а структурой «часовой пояс
+ * плюс текущее время»:
+ *
+ *     int32  bias          смещение пояса в минутах (UTC+3 -> -180)
+ *     uint16 year, month, day, hour, minute, second, ms, dayOfWeek
+ *
+ * В снятом дампе лежало 4c ff ff ff ea 07 08 00 0e 00 07 00 30 00 32 00 1a 01
+ * 05 00 — то есть -180 и 2026-08-14 07:48:50.282 UTC, пятница. Сходится и с
+ * часовым поясом машины, и со временем съёмки. Отсюда же у HiLink-свистков
+ * берутся правильные часы.
+ *
+ * Время берём своё, UTC, а пояс — параметром (по умолчанию 0, то есть UTC).
+ */
+static void put16(uint8_t *p, unsigned v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+static int send_win_sys(const struct found *f, int bias_minutes)
+{
+	struct usbdevfs_ctrltransfer ct;
+	uint8_t buf[20];
+	time_t now = time(NULL);
+	struct tm g;
+	int fd, rc, i;
+
+	gmtime_r(&now, &g);
+	buf[0] = (uint8_t)(bias_minutes);
+	buf[1] = (uint8_t)(bias_minutes >> 8);
+	buf[2] = (uint8_t)(bias_minutes >> 16);
+	buf[3] = (uint8_t)(bias_minutes >> 24);
+	put16(buf + 4,  (unsigned)g.tm_year + 1900);
+	put16(buf + 6,  (unsigned)g.tm_mon + 1);
+	put16(buf + 8,  (unsigned)g.tm_mday);
+	put16(buf + 10, (unsigned)g.tm_hour);
+	put16(buf + 12, (unsigned)g.tm_min);
+	put16(buf + 14, (unsigned)g.tm_sec);
+	put16(buf + 16, 0);
+	put16(buf + 18, (unsigned)g.tm_wday);
+
+	printf("SC_WIN_SYS: пояс %d мин, %04d-%02d-%02d %02d:%02d:%02d UTC, день недели %d\n",
+	       bias_minutes, g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
+	       g.tm_hour, g.tm_min, g.tm_sec, g.tm_wday);
+	printf("            ");
+	for (i = 0; i < 20; i++)
+		printf("%02x ", buf[i]);
+	printf("\n");
+
+	fd = open(f->node, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "SC_WIN_SYS: open %s: %s\n", f->node, strerror(errno));
+		return -1;
+	}
+	memset(&ct, 0, sizeof(ct));
+	ct.bRequestType = 0x40;
+	ct.bRequest     = 0xA2;
+	ct.wValue       = 0;
+	ct.wIndex       = 0;
+	ct.wLength      = sizeof(buf);
+	ct.timeout      = 3000;
+	ct.data         = buf;
+
+	rc = ioctl(fd, USBDEVFS_CONTROL, &ct);
+	if (rc < 0)
+		printf("SC_WIN_SYS: %s (на удачном переключении это норма)\n", strerror(errno));
+	else
+		printf("SC_WIN_SYS: принято, %d байт\n", rc);
+	close(fd);
+	return 0;
+}
+
 static uint32_t bot_tag = 0x12345678;
 
 static int bot_cmd(int fd, const struct found *f, const uint8_t *cmd, int cmdlen,
@@ -944,6 +1020,7 @@ int main(int argc, char **argv)
 {
 	struct found f;
 	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0, probe_only = 0, ctrl_only = 0, win_only = 0, xctl = 0;
+	int winsys_only = 0, bias_min = 0;
 	unsigned xt = 0, xr = 0, xv = 0, xi = 0, xl = 0;
 	uint8_t xdata[512];
 	int xdata_len = 0;
@@ -962,6 +1039,10 @@ int main(int argc, char **argv)
 			ctrl_only = 1;
 		} else if (strcmp(argv[i], "-W") == 0) {
 			win_only = 1;
+		} else if (strcmp(argv[i], "-t") == 0) {
+			winsys_only = 1;
+			if (i + 1 < argc && (argv[i + 1][0] == '-' ? argv[i + 1][1] >= '0' && argv[i + 1][1] <= '9' : argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9'))
+				bias_min = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "-D") == 0 && i + 1 < argc) {
 			/* Полезная нагрузка для -x: hex-строка любой длины. */
 			const char *h = argv[++i];
@@ -1157,6 +1238,15 @@ int main(int argc, char **argv)
 		else
 			hexline("ответ", xbuf, n2);
 		close(fd2);
+		return 0;
+	}
+	if (winsys_only) {
+		send_win_sys(&f, bias_min);
+		if (wait_for_switch(f.busid, wait_secs) >= 0)
+			printf("переключился: PID стал %04x\n",
+			       (unsigned)sysfs_hex(f.busid, "idProduct"));
+		else
+			printf("PID не изменился за %d с\n", wait_secs);
 		return 0;
 	}
 	if (win_only) {
