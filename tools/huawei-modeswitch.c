@@ -35,6 +35,7 @@
  *   -c       только послать старый управляющий запрос HuaweiMode, ничего больше
  *   -W       прикинуться Windows: запросить MS OS String Descriptor (0xEE) и
  *            Extended Compat ID — по ним прошивка Huawei и опознаёт хост
+ *   -R       повторить знакомство Windows целиком (см. replay_windows)
  *   -t [БИАС] послать SC_WIN_SYS — то же, чем представляется драйвер Huawei
  *            на Windows: пояс (минуты, UTC+3 = -180) и текущее время UTC
  *   -w СЕК   сколько ждать нового PID после каждой команды (по умолчанию 20)
@@ -717,6 +718,77 @@ static int send_win_sys(const struct found *f, int bias_minutes)
 	return 0;
 }
 
+/*
+ * Повторение того, что делает Windows.
+ *
+ * Из USBPcap-дампа живого E8372h-153 видно: Windows НЕ шлёт никакой команды
+ * переключения. Она делает обычное знакомство — читает дескрипторы, ставит
+ * конфигурацию, спрашивает строки, шлёт SET_INTERFACE, GET_MAX_LUN и один
+ * SCSI INQUIRY. На INQUIRY модем уже не отвечает (0 байт) и через 423 мс
+ * возвращается с PID 14db. То есть решение он принимает сам, по ходу
+ * знакомства, а перебор команд переключения был мимо цели с самого начала.
+ *
+ * Наш usb-storage делает почти то же самое, но двух запросов не делает
+ * никогда: SET_INTERFACE (Linux его пропускает, когда альтернативная
+ * настройка одна) и чтение СТРОКИ ИНТЕРФЕЙСА (индекс 4). Их и повторяем,
+ * в том же порядке и с тем же INQUIRY в конце.
+ */
+static int bot_cmd(int fd, const struct found *f, const uint8_t *cmd, int cmdlen,
+		   uint8_t lun, int dir_in, uint8_t *data, int datalen);
+
+static int replay_windows(const struct found *f)
+{
+	uint8_t buf[256];
+	uint8_t inquiry[6] = { 0x12, 0x00, 0x00, 0x00, 0x24, 0x00 };
+	int fd, ifnum = f->ifnum, n, st;
+
+	fd = open(f->node, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "replay: open %s: %s\n", f->node, strerror(errno));
+		return -1;
+	}
+
+	n = ctrl_in(fd, 0x80, 0x06, 0x0100, 0x0000, buf, 18);
+	printf("  дескриптор устройства: %d\n", n);
+	n = ctrl_in(fd, 0x80, 0x06, 0x0200, 0x0000, buf, 9);
+	printf("  дескриптор конфигурации: %d\n", n);
+	n = ctrl_in(fd, 0x80, 0x06, 0x0200, 0x0000, buf, 32);
+	printf("  конфигурация целиком: %d\n", n);
+
+	/* Строка интерфейса — то, чего Linux не спрашивает. */
+	n = ctrl_in(fd, 0x80, 0x06, 0x0304, 0x0409, buf, 4);
+	printf("  строка 4 (длина): %d\n", n);
+	n = ctrl_in(fd, 0x80, 0x06, 0x0304, 0x0409, buf, 26);
+	printf("  строка 4 (целиком): %d\n", n);
+	n = ctrl_in(fd, 0x80, 0x06, 0x0300, 0x0000, buf, 4);
+	printf("  langid: %d\n", n);
+	n = ctrl_in(fd, 0x80, 0x06, 0x0303, 0x0409, buf, 34);
+	printf("  серийный номер: %d\n", n);
+
+	/* SET_INTERFACE ровно в том виде, в каком его прислала Windows. */
+	n = ctrl_in(fd, 0x00, 0x0B, 0x0000, 0x0000, buf, 0);
+	printf("  SET_INTERFACE (bmReq=0x00): %d%s\n", n,
+	       n < 0 ? strerror(errno) : "");
+	if (n < 0) {
+		n = ctrl_in(fd, 0x01, 0x0B, 0x0000, 0x0000, buf, 0);
+		printf("  SET_INTERFACE (bmReq=0x01): %d\n", n);
+	}
+
+	/* GET_MAX_LUN и один INQUIRY — как у Windows. */
+	n = ctrl_in(fd, 0xA1, 0xFE, 0x0000, 0x0000, buf, 1);
+	printf("  GET_MAX_LUN: %d%s\n", n, n == 1 ? "" : " (нет ответа)");
+
+	if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifnum) == 0) {
+		memset(buf, 0, sizeof(buf));
+		st = bot_cmd(fd, f, inquiry, sizeof(inquiry), 0, 1, buf, 36);
+		printf("  SCSI INQUIRY: статус %d\n", st);
+		ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifnum);
+	}
+
+	close(fd);
+	return 0;
+}
+
 static uint32_t bot_tag = 0x12345678;
 
 static int bot_cmd(int fd, const struct found *f, const uint8_t *cmd, int cmdlen,
@@ -1020,7 +1092,7 @@ int main(int argc, char **argv)
 {
 	struct found f;
 	int dry_run = 0, i, wait_secs = 20, custom_ok = 0, did_reset = 0, probe_only = 0, ctrl_only = 0, win_only = 0, xctl = 0;
-	int winsys_only = 0, bias_min = 0;
+	int winsys_only = 0, bias_min = 0, replay_only = 0;
 	unsigned xt = 0, xr = 0, xv = 0, xi = 0, xl = 0;
 	uint8_t xdata[512];
 	int xdata_len = 0;
@@ -1039,6 +1111,8 @@ int main(int argc, char **argv)
 			ctrl_only = 1;
 		} else if (strcmp(argv[i], "-W") == 0) {
 			win_only = 1;
+		} else if (strcmp(argv[i], "-R") == 0) {
+			replay_only = 1;
 		} else if (strcmp(argv[i], "-t") == 0) {
 			winsys_only = 1;
 			if (i + 1 < argc && (argv[i + 1][0] == '-' ? argv[i + 1][1] >= '0' && argv[i + 1][1] <= '9' : argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9'))
@@ -1238,6 +1312,18 @@ int main(int argc, char **argv)
 		else
 			hexline("ответ", xbuf, n2);
 		close(fd2);
+		return 0;
+	}
+	if (replay_only) {
+		if (unbind_if_needed(&f) != 0)
+			fprintf(stderr, "unbind не удался, пробуем всё равно\n");
+		printf("повторяю знакомство Windows:\n");
+		replay_windows(&f);
+		if (wait_for_switch(f.busid, wait_secs) >= 0)
+			printf("переключился: PID стал %04x\n",
+			       (unsigned)sysfs_hex(f.busid, "idProduct"));
+		else
+			printf("PID не изменился за %d с\n", wait_secs);
 		return 0;
 	}
 	if (winsys_only) {
