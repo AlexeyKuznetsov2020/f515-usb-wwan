@@ -748,6 +748,14 @@ static int replay_windows(const struct found *f)
 		return -1;
 	}
 
+	/*
+	 * Интерфейс надо захватить ДО запросов, а не только перед bulk. Иначе
+	 * ядро пишет "did not claim interface 0 before use", а запросы с
+	 * получателем interface (тот же GET_MAX_LUN) уходят вхолостую.
+	 */
+	if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifnum) < 0)
+		fprintf(stderr, "replay: claim ifno=%d: %s\n", ifnum, strerror(errno));
+
 	n = ctrl_in(fd, 0x80, 0x06, 0x0100, 0x0000, buf, 18);
 	printf("  дескриптор устройства: %d\n", n);
 	n = ctrl_in(fd, 0x80, 0x06, 0x0200, 0x0000, buf, 9);
@@ -778,13 +786,11 @@ static int replay_windows(const struct found *f)
 	n = ctrl_in(fd, 0xA1, 0xFE, 0x0000, 0x0000, buf, 1);
 	printf("  GET_MAX_LUN: %d%s\n", n, n == 1 ? "" : " (нет ответа)");
 
-	if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifnum) == 0) {
-		memset(buf, 0, sizeof(buf));
-		st = bot_cmd(fd, f, inquiry, sizeof(inquiry), 0, 1, buf, 36);
-		printf("  SCSI INQUIRY: статус %d\n", st);
-		ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifnum);
-	}
+	memset(buf, 0, sizeof(buf));
+	st = bot_cmd(fd, f, inquiry, sizeof(inquiry), 0, 1, buf, 36);
+	printf("  SCSI INQUIRY: статус %d\n", st);
 
+	ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifnum);
 	close(fd);
 	return 0;
 }
@@ -1264,6 +1270,50 @@ int main(int argc, char **argv)
 		return send_switch(&f, custom_ok ? custom : methods[0].msg);
 	}
 
+	if (replay_only) {
+		if (unbind_if_needed(&f) != 0)
+			fprintf(stderr, "unbind не удался, пробуем всё равно\n");
+		printf("повторяю знакомство Windows:\n");
+		replay_windows(&f);
+		if (wait_for_switch(f.busid, wait_secs) >= 0)
+			printf("переключился: PID стал %04x\n",
+			       (unsigned)sysfs_hex(f.busid, "idProduct"));
+		else
+			printf("PID не изменился за %d с\n", wait_secs);
+		return 0;
+	}
+	if (winsys_only) {
+		send_win_sys(&f, bias_min);
+		if (wait_for_switch(f.busid, wait_secs) >= 0)
+			printf("переключился: PID стал %04x\n",
+			       (unsigned)sysfs_hex(f.busid, "idProduct"));
+		else
+			printf("PID не изменился за %d с\n", wait_secs);
+		return 0;
+	}
+	if (win_only) {
+		pretend_windows(&f);
+		if (wait_for_switch(f.busid, wait_secs) >= 0)
+			printf("переключился: PID стал %04x\n",
+			       (unsigned)sysfs_hex(f.busid, "idProduct"));
+		else
+			printf("PID не изменился за %d с\n", wait_secs);
+		return 0;
+	}
+	if (ctrl_only) {
+		send_huawei_control(&f);
+		if (wait_for_switch(f.busid, wait_secs) >= 0)
+			printf("переключился: PID стал %04x\n",
+			       (unsigned)sysfs_hex(f.busid, "idProduct"));
+		else
+			printf("PID не изменился за %d с\n", wait_secs);
+		return 0;
+	}
+	if (probe_only) {
+		printf("PID сейчас: %04x\n", (unsigned)sysfs_hex(f.busid, "idProduct"));
+		return 0;
+	}
+
 	/*
 	 * Осиротевший storage-интерфейс — само по себе признак беды: модем в таком
 	 * состоянии на bulk-OUT не отвечает вовсе. Сбрасываем сразу, до первой
@@ -1314,50 +1364,6 @@ int main(int argc, char **argv)
 		close(fd2);
 		return 0;
 	}
-	if (replay_only) {
-		if (unbind_if_needed(&f) != 0)
-			fprintf(stderr, "unbind не удался, пробуем всё равно\n");
-		printf("повторяю знакомство Windows:\n");
-		replay_windows(&f);
-		if (wait_for_switch(f.busid, wait_secs) >= 0)
-			printf("переключился: PID стал %04x\n",
-			       (unsigned)sysfs_hex(f.busid, "idProduct"));
-		else
-			printf("PID не изменился за %d с\n", wait_secs);
-		return 0;
-	}
-	if (winsys_only) {
-		send_win_sys(&f, bias_min);
-		if (wait_for_switch(f.busid, wait_secs) >= 0)
-			printf("переключился: PID стал %04x\n",
-			       (unsigned)sysfs_hex(f.busid, "idProduct"));
-		else
-			printf("PID не изменился за %d с\n", wait_secs);
-		return 0;
-	}
-	if (win_only) {
-		pretend_windows(&f);
-		if (wait_for_switch(f.busid, wait_secs) >= 0)
-			printf("переключился: PID стал %04x\n",
-			       (unsigned)sysfs_hex(f.busid, "idProduct"));
-		else
-			printf("PID не изменился за %d с\n", wait_secs);
-		return 0;
-	}
-	if (ctrl_only) {
-		send_huawei_control(&f);
-		if (wait_for_switch(f.busid, wait_secs) >= 0)
-			printf("переключился: PID стал %04x\n",
-			       (unsigned)sysfs_hex(f.busid, "idProduct"));
-		else
-			printf("PID не изменился за %d с\n", wait_secs);
-		return 0;
-	}
-	if (probe_only) {
-		printf("PID сейчас: %04x\n", (unsigned)sysfs_hex(f.busid, "idProduct"));
-		return 0;
-	}
-
 	for (i = 0; i < (custom_ok ? 1 : N_METHODS); i++) {
 		const uint8_t *msg = custom_ok ? custom : methods[i].msg;
 		int pid, rc;
