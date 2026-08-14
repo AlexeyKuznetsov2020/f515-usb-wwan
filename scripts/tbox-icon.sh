@@ -37,6 +37,11 @@ LOG=$STATE/tbox.log
 PIDFILE=$STATE/tbox.pid
 SWITCH=$STATE/icon
 CAP_CACHE=$STATE/icon-capable
+# «Новый путь» для машины БЕЗ опции TBOX (config tbox=0): tmpfs-файл, который читает Frida-твик
+# iSpaceToolbox «Статус сети» и рисует иконку в статус-баре напрямую (штатная цепочка ID_CELLULAR_*
+# там мертва). tmpfs (/dev), НЕ /data/local/tmp — файл переписывается каждые несколько секунд, а
+# /data/local/tmp на этой голове — флеш. Формат — см. TboxWire.writeSignalFile / твик.
+SIGNAL_BRIDGE=${TBOX_SIGNAL_FILE:-/dev/network-status-signal}
 
 mkdir -p "$STATE" 2>/dev/null
 
@@ -152,12 +157,19 @@ start)
 	need_jar
 	PID=$(running_pid)
 	[ -n "$PID" ] && { echo "уже работает, pid $PID (остановить: $0 stop)"; exit 0; }
-	capable || {
-		echo "$CAPABLE_WHY" >&2
-		echo "эмуляция TBOX здесь ничего не покажет — панель не создаёт сотовую иконку." >&2
-		echo "если всё равно надо: TBOX_ICON_FORCE=1 $0 start" >&2
-		exit 3
-	}
+	# Режим по состоянию машины (см. capable):
+	#   tbox=1 -> ШТАТНАЯ цепочка (SOME/IP), панель рисует иконку сама («старый путь»);
+	#   tbox=0 -> МОСТ В ФАЙЛ: SOME/IP всё равно поднимаем (вхолостую), но ещё пишем сигнал в
+	#             $SIGNAL_BRIDGE, откуда его берёт Frida-твик iSpaceToolbox «Статус сети».
+	EXTRA=
+	if capable; then
+		echo "режим: штатная цепочка ($CAPABLE_WHY)"
+	else
+		echo "режим: мост в файл — $CAPABLE_WHY"
+		echo "иконку рисует твик iSpaceToolbox «Статус сети» из $SIGNAL_BRIDGE (без него не видно)"
+		: > "$SIGNAL_BRIDGE" 2>/dev/null && chmod 666 "$SIGNAL_BRIDGE" 2>/dev/null
+		EXTRA="--signal-file $SIGNAL_BRIDGE"
+	fi
 	add_alias
 	# Логи только дописываются, logrotate на голове нет. Старт — самая удобная
 	# точка усечения: файл ещё никем не открыт, а дальше в него будет писать
@@ -172,7 +184,7 @@ start)
 	# setsid + закрытый stdin: процесс должен пережить обрыв adb-сессии, из которой
 	# его запустили. Именно так приложение стартует и wwan-boot.sh.
 	setsid sh -c "CLASSPATH=$JAR exec app_process /system/bin --nice-name=tboxwire \
-		TboxWire --src $SRC_IP --iface $IFACE --wwan-dir $DIR $*" \
+		TboxWire --src $SRC_IP --iface $IFACE --wwan-dir $DIR $EXTRA $*" \
 		</dev/null >>"$LOG" 2>&1 &
 	i=0
 	while [ $i -lt 10 ]; do
@@ -195,9 +207,10 @@ auto)
 	# Вызывается из wwan-up.sh и из watchdog'а wwan-boot.sh, поэтому молчаливая и
 	# ничего не ломает: выключено — вышли, уже работает — вышли.
 	enabled || { echo "иконка выключена (state/icon=off)"; exit 0; }
-	# Не просто «нечего показывать»: на такой голове поллер каждые 5 с дёргал бы AT-порт
-	# модема впустую и конкурировал за него с wwan-up.sh.
-	capable || { echo "иконка: $CAPABLE_WHY — эмуляцию TBOX не запускаем"; exit 0; }
+	# Раньше здесь стоял `capable || exit` — чтобы на голове без TBOX не гонять AT-порт впустую.
+	# Теперь при tbox=0 иконку рисует твик iSpaceToolbox из файла-моста, и поллер как раз нужен:
+	# режим (штатный SOME/IP либо мост в файл) выбирает сам `start` по capable. Выключатель —
+	# state/icon (enabled выше). Если твик не установлен, файл просто никто не читает.
 	[ -f "$JAR" ] || { echo "иконка: нет $JAR, пропускаем"; exit 0; }
 	[ -n "$(running_pid)" ] && exit 0
 	sh "$0" start >/dev/null 2>&1 || echo "иконка: запустить не вышло, см. $LOG"
@@ -228,7 +241,10 @@ status)
 	fi
 	echo "running=$([ -n "$PID" ] && echo 1 || echo 0)"
 	echo "enabled=$(enabled && echo 1 || echo 0)"
-	if capable; then echo "capable=1"; else echo "capable=0"; fi
+	# capable = штатная цепочка (config tbox=1). mode = каким путём рисуется иконка:
+	#   native — штатная панель (tbox=1); bridge — через файл-мост + твик iSpaceToolbox (tbox=0).
+	# В обоих режимах иконку МОЖНО показать, поэтому приложение больше не блокирует «Включить».
+	if capable; then echo "capable=1"; echo "mode=native"; else echo "capable=0"; echo "mode=bridge"; fi
 	echo "capable_why=$CAPABLE_WHY"
 	echo "алиас:    $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | grep " $SRC_IP/" |
 		sed 's/  */ /g' || echo "нет $SRC_IP на $IFACE")"
@@ -260,10 +276,11 @@ fake)
 
 capable)
 	if capable; then
-		echo "штатная иконка возможна: $CAPABLE_WHY"
+		echo "режим native: штатная иконка панели — $CAPABLE_WHY"
 	else
-		echo "штатной иконки на этой голове нет: $CAPABLE_WHY"
-		exit 1
+		echo "режим bridge: штатной цепочки нет ($CAPABLE_WHY),"
+		echo "иконку рисует твик iSpaceToolbox «Статус сети» из файла-моста $SIGNAL_BRIDGE"
+		# НЕ exit 1: раньше это означало «иконки нет вообще», теперь — «другой путь».
 	fi
 	;;
 
