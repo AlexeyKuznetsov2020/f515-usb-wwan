@@ -140,6 +140,13 @@ public final class TboxWire {
     static boolean signalOnly = false; // разовый опрос модема и выход, без SOME/IP
     static String gwOverride = null;   // адрес веб-API hilink-модема, если не угадывается
     static int regOverride = -1;       // сырой celluarRegisterStatus — посмотреть, что нарисуется
+    // --signal-file PATH: «новый путь» для машины БЕЗ опции TBOX (config tbox=0). Там панель не
+    // подписывается на ID_CELLULAR_* (SystemUI гейт по ID_CELLULAR_ENABLE), поэтому SOME/IP-события
+    // никто не слушает. Вместо этого пишем reg/strength в tmpfs-файл, который читает Frida-твик
+    // iSpaceToolbox «Статус сети» (com.android.systemui) и рисует иконку напрямую. SOME/IP при этом
+    // продолжает работать вхолостую — безвредно. tbox=1 -> файл не пишем, работает штатная цепочка.
+    // Формат строки: "<reg> <strength> <card> <monoSec>" (monoSec = /proc/uptime, для проверки свежести).
+    static String signalFile = null;
 
     static volatile int session = 1;
     static final List<Socket> clients = new ArrayList<Socket>();
@@ -425,6 +432,30 @@ public final class TboxWire {
         t.start();
     }
 
+    /** Монотонные секунды из /proc/uptime — как у твика; настенные часы головы прыгают. */
+    static long uptimeSec() {
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/uptime"));
+            String l = r.readLine();
+            r.close();
+            return (long) Double.parseDouble(l.trim().split("\\s+")[0]);
+        } catch (Exception e) { return 0; }
+    }
+
+    // Зеркалим сигнал в tmpfs-файл signalFile: "<reg> <strength> <card> <monoSec>".
+    // Прямая перезапись (не temp+rename), чтобы сохранить mode 666, выставленный один раз при
+    // создании (rename дал бы новый inode с umask-режимом — SystemUI под u0_a33 не прочитал бы).
+    // Рваное чтение маловероятно и на стороне твика лечится проверкой формата + свежести.
+    static void writeSignalFile(Sig sig) {
+        try {
+            int card = sig.strength >= 0 ? 1 : 0;
+            String line = sig.reg + " " + sig.strength + " " + card + " " + uptimeSec() + "\n";
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(signalFile);
+            fos.write(line.getBytes("US-ASCII"));
+            fos.close();
+        } catch (Exception e) { /* tmpfs-мост, разовые ошибки не важны */ }
+    }
+
     static void startNotifier() {
         Thread t = new Thread(new Runnable() {
             public void run() {
@@ -467,6 +498,9 @@ public final class TboxWire {
                     // подхватывает чужой такт и первый кадр выпадает случайным.
                     if (next != phase) tick = 0;
                     phase = next;
+                    // «Новый путь» (tbox=0): зеркалим текущий сигнал в tmpfs-файл для Frida-твика,
+                    // независимо от того, есть ли TCP-подписчики (при tbox=0 их и не будет).
+                    if (signalFile != null) writeSignalFile(sig);
                     byte[] msg = buildNotification(buildPayload(sig.reg, ESIM_STATUS_OK,
                             SERVICE_STATUS_CONNECTED, ROAMING_NONE, sig.strength, 0));
                     n++;
@@ -1159,6 +1193,7 @@ public final class TboxWire {
             else if ("--reg".equals(s)) regOverride = Integer.parseInt(a[++i]);
             else if ("--probe".equals(s)) probeOnly = true;
             else if ("--signal".equals(s)) signalOnly = true;
+            else if ("--signal-file".equals(s)) signalFile = a[++i];
             else throw new IllegalArgumentException("неизвестный аргумент: " + s);
         }
     }
