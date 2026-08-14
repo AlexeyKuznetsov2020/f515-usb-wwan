@@ -34,8 +34,8 @@ if ! command -v javac >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! command -v zip >/dev/null 2>&1; then
-    echo "не найден zip — он нужен, чтобы упаковать classes.dex в jar" >&2
+if ! command -v jar >/dev/null 2>&1; then
+    echo "не найден jar — он есть в любом JDK; проверь, что bin JDK на PATH" >&2
     exit 1
 fi
 
@@ -84,12 +84,14 @@ D8_LIB=()
 [ -f "$OUT/dex/classes.dex" ] || { echo "d8 не выдал classes.dex" >&2; exit 1; }
 
 echo "== jar"
-# zip обновляет запись classes.dex на месте, старый jar сносить не нужно.
-(cd "$OUT/dex" && zip -q -X "$JAR" classes.dex)
+# Пакуем classes.dex через jar из JDK, а не zip: jar есть везде, где есть javac,
+# а zip в Git Bash на Windows может отсутствовать. В tboxwire.jar только
+# classes.dex (app_process'у больше не нужно), поэтому cfM без манифеста.
+(cd "$OUT/dex" && jar cfM "$JAR" classes.dex)
 
 echo "== готово"
 ls -la "$JAR"
-unzip -l "$JAR"
+jar tf "$JAR"
 echo
 echo "Дальше:"
 echo "  cp $JAR ../app/assets/            # чтобы приложение раскладывало свежий"

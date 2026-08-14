@@ -8,8 +8,8 @@
 set -euo pipefail
 
 SDK=${ANDROID_SDK:-/home/dsultanr/android-sdk}
-BT=$SDK/android-14
-PLATFORM=$SDK/android-11/android.jar
+BT=${ANDROID_BUILD_TOOLS:-$SDK/android-14}
+PLATFORM=${ANDROID_JAR:-$SDK/android-11/android.jar}
 PROJ=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$PROJ/.." && pwd)
 OUT=$PROJ/build
@@ -51,17 +51,34 @@ echo "== aapt2 link (manifest + assets + res)"
 
 echo "== javac"
 find "$PROJ/src" -name '*.java' > "$OUT/sources.txt"
+# На Windows (Git Bash) javac нативный и POSIX-пути из @-файла не понимает —
+# видит /tmp/... как \tmp\... и падает "file not found". Аргументы командной
+# строки MSYS конвертирует сам, а содержимое @-файла — нет, поэтому переводим
+# список в Windows-вид через cygpath. На Linux cygpath нет, список не трогаем.
+if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w -f "$OUT/sources.txt" > "$OUT/sources.win.txt"
+    mv -f "$OUT/sources.win.txt" "$OUT/sources.txt"
+fi
 javac -source 8 -target 8 -nowarn \
     -bootclasspath "$PLATFORM" \
     -d "$OUT/classes" @"$OUT/sources.txt" 2>&1 | grep -v 'bootstrap class path' || true
 
+if [ -z "$(find "$OUT/classes" -name '*.class' 2>/dev/null)" ]; then
+    echo "javac не выдал ни одного .class — сборка провалилась" >&2
+    exit 1
+fi
+
 echo "== d8"
-"$BT/d8" --min-api 26 --output "$OUT/dex" \
+# --lib с android.jar обязателен: без него d8 не может разрешить иерархию
+# вложенных анонимных классов (BootService$1$1) и падает NPE. tbox/build.sh
+# передаёт его же.
+"$BT/d8" --min-api 26 --lib "$PLATFORM" --output "$OUT/dex" \
     $(find "$OUT/classes" -name '*.class')
 
 echo "== package"
 cp "$OUT/base.apk" "$OUT/unsigned.apk"
-(cd "$OUT/dex" && zip -q -X "$OUT/unsigned.apk" classes.dex)
+# classes.dex кладём в apk через jar (zip в Git Bash на Windows может не быть; jar есть с JDK)
+(cd "$OUT/dex" && jar uf "$OUT/unsigned.apk" classes.dex)
 
 echo "== zipalign + sign"
 if [ ! -f "$PROJ/keystore.jks" ]; then
