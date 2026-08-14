@@ -140,11 +140,13 @@ public final class TboxWire {
     static boolean signalOnly = false; // разовый опрос модема и выход, без SOME/IP
     static String gwOverride = null;   // адрес веб-API hilink-модема, если не угадывается
     static int regOverride = -1;       // сырой celluarRegisterStatus — посмотреть, что нарисуется
-    // --signal-file PATH: «новый путь» для машины БЕЗ опции TBOX (config tbox=0). Там панель не
-    // подписывается на ID_CELLULAR_* (SystemUI гейт по ID_CELLULAR_ENABLE), поэтому SOME/IP-события
-    // никто не слушает. Вместо этого пишем reg/strength в tmpfs-файл, который читает Frida-твик
-    // iSpaceToolbox «Статус сети» (com.android.systemui) и рисует иконку напрямую. SOME/IP при этом
-    // продолжает работать вхолостую — безвредно. tbox=1 -> файл не пишем, работает штатная цепочка.
+    // --signal-file PATH: второй, файловый путь для машины БЕЗ опции TBOX (config tbox=0). Там
+    // панель не подписывается на ID_CELLULAR_* (SystemUI гейт по ID_CELLULAR_ENABLE), поэтому
+    // SOME/IP-события никто не слушает. Вместо этого пишем reg/strength в tmpfs-файл, который
+    // читает Frida-твик iSpaceToolbox «Статус сети» (com.android.systemui) и рисует иконку
+    // напрямую. tbox-icon.sh передаёт ключ ВСЕГДА, не спрашивая конфиг машины: на tbox=1 файл
+    // просто никто не читает, зато ошибка в определении режима (а на раннем старте конфиг может
+    // ещё не читаться) не оставляет голову без иконки. SOME/IP работает в обоих случаях.
     // Формат строки: "<reg> <strength> <card> <monoSec>" (monoSec = /proc/uptime, для проверки свежести).
     static String signalFile = null;
 
@@ -450,9 +452,15 @@ public final class TboxWire {
         try {
             int card = sig.strength >= 0 ? 1 : 0;
             String line = sig.reg + " " + sig.strength + " " + card + " " + uptimeSec() + "\n";
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(signalFile);
+            java.io.File f = new java.io.File(signalFile);
+            // Обычно файл заводит tbox-icon.sh и сразу ставит 666, но если его почему-то не
+            // оказалось, создаём мы — под root и с umask, то есть 600, и твик в SystemUI молча
+            // не прочитал бы ни байта. Права ставим ровно при создании: inode дальше тот же.
+            boolean fresh = !f.exists();
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(f);
             fos.write(line.getBytes("US-ASCII"));
             fos.close();
+            if (fresh) f.setReadable(true, false);
         } catch (Exception e) { /* tmpfs-мост, разовые ошибки не важны */ }
     }
 
@@ -498,8 +506,8 @@ public final class TboxWire {
                     // подхватывает чужой такт и первый кадр выпадает случайным.
                     if (next != phase) tick = 0;
                     phase = next;
-                    // «Новый путь» (tbox=0): зеркалим текущий сигнал в tmpfs-файл для Frida-твика,
-                    // независимо от того, есть ли TCP-подписчики (при tbox=0 их и не будет).
+                    // Зеркалим текущий сигнал в tmpfs-файл для Frida-твика — независимо от того,
+                    // есть ли TCP-подписчики (при tbox=0 их и не будет, при tbox=1 будут оба).
                     if (signalFile != null) writeSignalFile(sig);
                     byte[] msg = buildNotification(buildPayload(sig.reg, ESIM_STATUS_OK,
                             SERVICE_STATUS_CONNECTED, ROAMING_NONE, sig.strength, 0));
