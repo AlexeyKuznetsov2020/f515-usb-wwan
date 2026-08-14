@@ -450,9 +450,15 @@ public final class TboxWire {
         try {
             int card = sig.strength >= 0 ? 1 : 0;
             String line = sig.reg + " " + sig.strength + " " + card + " " + uptimeSec() + "\n";
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(signalFile);
+            java.io.File f = new java.io.File(signalFile);
+            // Обычно файл заводит tbox-icon.sh и сразу ставит 666, но если его почему-то не
+            // оказалось, создаём мы — под root и с umask, то есть 600, и твик в SystemUI молча
+            // не прочитал бы ни байта. Права ставим ровно при создании: inode дальше тот же.
+            boolean fresh = !f.exists();
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(f);
             fos.write(line.getBytes("US-ASCII"));
             fos.close();
+            if (fresh) f.setReadable(true, false);
         } catch (Exception e) { /* tmpfs-мост, разовые ошибки не важны */ }
     }
 

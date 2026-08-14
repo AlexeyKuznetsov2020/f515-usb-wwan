@@ -12,6 +12,8 @@
 # Выключатель — файл state/icon со словом on/off внутри (а не «есть файл/нет файла»:
 # в этом проекте запрещено удалять что-либо, а выключатель должен сниматься). Пока там
 # off, `auto` молчит, и модем поднимается без всякой иконки. Файла нет — считаем on.
+# Исключение — режим bridge (машина без опции TBOX, рисует твик iSpaceToolbox): там «файла
+# нет» означает «не включали», и `auto` сам не стартует, чтобы зря не занимать AT-порт модема.
 #
 # Под капотом — tboxwire.jar: он притворяется блоком TBOX, которого на стенде нет, и шлёт
 # голове по SOME/IP цифры нашего модема. Подробности — docs/status-icon.md.
@@ -42,10 +44,17 @@ CAP_CACHE=$STATE/icon-capable
 # там мертва). tmpfs (/dev), НЕ /data/local/tmp — файл переписывается каждые несколько секунд, а
 # /data/local/tmp на этой голове — флеш. Формат — см. TboxWire.writeSignalFile / твик.
 SIGNAL_BRIDGE=${TBOX_SIGNAL_FILE:-/dev/network-status-signal}
+# Каким путём запущен живой процесс: native | bridge. Нужен `auto`, чтобы заметить, что
+# режим разъехался с реальным состоянием машины, и перезапустить tboxwire (см. `auto`).
+MODEFILE=$STATE/icon-mode
 
 mkdir -p "$STATE" 2>/dev/null
 
 enabled() { [ "$(cat "$SWITCH" 2>/dev/null)" != off ]; }
+
+# Иконку включали явно (кнопкой «Включить» / ручным `start`), а не просто «не выключали».
+# Разница важна только для bridge — см. `auto`.
+switched_on() { [ "$(cat "$SWITCH" 2>/dev/null)" = on ]; }
 
 # --- умеет ли эта голова показать штатную иконку вообще ----------------------
 #
@@ -163,12 +172,19 @@ start)
 	#             $SIGNAL_BRIDGE, откуда его берёт Frida-твик iSpaceToolbox «Статус сети».
 	EXTRA=
 	if capable; then
+		MODE=native
 		echo "режим: штатная цепочка ($CAPABLE_WHY)"
 	else
+		MODE=bridge
 		echo "режим: мост в файл — $CAPABLE_WHY"
 		echo "иконку рисует твик iSpaceToolbox «Статус сети» из $SIGNAL_BRIDGE (без него не видно)"
-		: > "$SIGNAL_BRIDGE" 2>/dev/null && chmod 666 "$SIGNAL_BRIDGE" 2>/dev/null
-		EXTRA="--signal-file $SIGNAL_BRIDGE"
+		# chmod отдельной командой, а не через `&&`: файл мог остаться с прошлого запуска
+		# (в /dev, но с правами 600 от того, кто создал его первым) — тогда `: >` его только
+		# усечёт, а права надо всё равно поправить, иначе SystemUI молча не прочитает.
+		: >"$SIGNAL_BRIDGE" 2>/dev/null
+		chmod 666 "$SIGNAL_BRIDGE" 2>/dev/null
+		# Кавычки внутри строки для `sh -c`: путь задаётся снаружи ($TBOX_SIGNAL_FILE).
+		EXTRA="--signal-file '$SIGNAL_BRIDGE'"
 	fi
 	add_alias
 	# Логи только дописываются, logrotate на голове нет. Старт — самая удобная
@@ -200,6 +216,7 @@ start)
 	fi
 	echo "$PID" >"$PIDFILE"
 	echo on >"$SWITCH"
+	echo "$MODE" >"$MODEFILE"
 	echo "запущен, pid $PID, лог $LOG"
 	;;
 
@@ -207,12 +224,33 @@ auto)
 	# Вызывается из wwan-up.sh и из watchdog'а wwan-boot.sh, поэтому молчаливая и
 	# ничего не ломает: выключено — вышли, уже работает — вышли.
 	enabled || { echo "иконка выключена (state/icon=off)"; exit 0; }
-	# Раньше здесь стоял `capable || exit` — чтобы на голове без TBOX не гонять AT-порт впустую.
-	# Теперь при tbox=0 иконку рисует твик iSpaceToolbox из файла-моста, и поллер как раз нужен:
-	# режим (штатный SOME/IP либо мост в файл) выбирает сам `start` по capable. Выключатель —
-	# state/icon (enabled выше). Если твик не установлен, файл просто никто не читает.
 	[ -f "$JAR" ] || { echo "иконка: нет $JAR, пропускаем"; exit 0; }
-	[ -n "$(running_pid)" ] && exit 0
+	# Раньше здесь стоял `capable || exit` — чтобы на голове без TBOX не гонять AT-порт впустую.
+	# Теперь при tbox=0 иконку рисует твик iSpaceToolbox из файла-моста, и поллер как раз нужен —
+	# но ТОЛЬКО если твик и правда включён, а этого мы отсюда не видим. Поэтому в bridge
+	# автозапуск не по умолчанию, а по явному «Включить» (кнопка в приложении / ручной `start`
+	# пишут в state/icon «on»). Иначе на чужой голове без твика мы бы каждые 5 с дёргали AT-порт
+	# модема, конкурируя за него с wwan-up.sh, и ничего при этом не показывали.
+	if capable; then WANT=native; else WANT=bridge; fi
+	if [ "$WANT" = bridge ] && ! switched_on; then AUTO_OK=0; else AUTO_OK=1; fi
+	PID=$(running_pid)
+	if [ -n "$PID" ]; then
+		# Режим выбирается один раз, при `start`, — а на раннем старте конфиг машины мог ещё
+		# не читаться: capable тогда отвечает «иконка есть» (native) и ответ не кеширует.
+		# Без этой сверки процесс так и остался бы в native до ручного рестарта, не написав
+		# в мост ни байта, — то есть на tbox=0 иконки после ребута просто не было бы.
+		HAVE=$(cat "$MODEFILE" 2>/dev/null)
+		if [ "$CAPABLE_SURE" != 1 ] || [ -z "$HAVE" ] || [ "$HAVE" = "$WANT" ]; then exit 0; fi
+		echo "иконка: режим сменился ($HAVE -> $WANT), перезапускаем"
+		# Не через `stop`: тот пишет в state/icon «off» и выключил бы иконку насовсем, если
+		# следом `start` не поднимется.
+		kill "$PID" 2>/dev/null || kill -9 "$PID" 2>/dev/null
+		: >"$PIDFILE" 2>/dev/null
+		[ "$AUTO_OK" = 1 ] || { echo "иконка: режим bridge без явного «Включить» — не поднимаем"; exit 0; }
+		sleep 1
+	else
+		[ "$AUTO_OK" = 1 ] || { echo "иконка: режим bridge — автозапуск после «Включить» в приложении"; exit 0; }
+	fi
 	sh "$0" start >/dev/null 2>&1 || echo "иконка: запустить не вышло, см. $LOG"
 	;;
 
@@ -246,6 +284,10 @@ status)
 	# В обоих режимах иконку МОЖНО показать, поэтому приложение больше не блокирует «Включить».
 	if capable; then echo "capable=1"; echo "mode=native"; else echo "capable=0"; echo "mode=bridge"; fi
 	echo "capable_why=$CAPABLE_WHY"
+	# Поднимет ли её `auto` сам после подъёма модема. В native это просто «не выключена»,
+	# в bridge — ещё и «включали явно» (см. `auto`), поэтому отдельным полем: `enabled`
+	# на такой голове может быть 1, а автозапуска всё равно нет.
+	if enabled && { capable || switched_on; }; then echo "autostart=1"; else echo "autostart=0"; fi
 	echo "алиас:    $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | grep " $SRC_IP/" |
 		sed 's/  */ /g' || echo "нет $SRC_IP на $IFACE")"
 	echo "WAN:      $(cat "$STATE/wan-iface" 2>/dev/null || echo "неизвестен (модем не поднимали)")"

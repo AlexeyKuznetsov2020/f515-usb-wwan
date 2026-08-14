@@ -266,8 +266,16 @@ public class MainActivity extends Activity {
             msg.append("Штатная панель рисует иконку сама (config tbox=1).\n\n");
         }
         msg.append("Сейчас: ").append(running ? "работает" : "не запущена").append('\n');
-        msg.append("После подъёма модема: ").append(value(status, "enabled").equals("1")
-                ? "включается сама" : "не включается (выключено вручную)").append('\n');
+        // Не `enabled`: в bridge сама она после ребута не поднимется, пока её хоть раз не
+        // включили здесь кнопкой (иначе поллер зря занимал бы AT-порт модема). Ответ на этот
+        // вопрос целиком считает скрипт — поле autostart; enabled оставлен для старых версий.
+        String autostart = value(status, "autostart");
+        if (autostart.isEmpty()) autostart = value(status, "enabled");
+        msg.append("После подъёма модема: ").append(autostart.equals("1")
+                ? "включается сама"
+                : bridge && !value(status, "enabled").equals("0")
+                        ? "не включается (включите один раз кнопкой ниже)"
+                        : "не включается (выключено вручную)").append('\n');
         msg.append("\nНа сам интернет это никак не влияет — только на картинку в статус-баре.");
 
         AlertDialog.Builder b = new AlertDialog.Builder(this)
