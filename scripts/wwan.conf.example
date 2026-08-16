@@ -7,3 +7,6 @@ WWAN_APN=internet          # APN оператора (beeline: internet.beeline.k
 #WWAN_DIAL='*99#'          # номер дозвона
 #WWAN_TABLE=99             # таблица маршрутизации для ppp0
 #WWAN_MODDIR=/data/local/tmp   # где лежат .ko и huawei-modeswitch
+#WWAN_DNS=1.1.1.1          # DNS для приложений вместо того, что дал оператор;
+                           # auto или пусто — как раньше. Главнее кнопки «DNS» в
+                           # приложении (она пишет в state/dns). См. docs/app-network.md

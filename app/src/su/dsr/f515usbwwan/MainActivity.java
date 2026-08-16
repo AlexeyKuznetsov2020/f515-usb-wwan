@@ -58,6 +58,7 @@ public class MainActivity extends Activity {
         addRunButton("Выключить", "--down");
         addAutostartButton();
         addIconButton();
+        addDnsButton();
         addUrlButton("Интернетометр", SPEEDTEST_URL);
         addFormatButton();
         HorizontalScrollView buttonsScroll = new HorizontalScrollView(this);
@@ -319,6 +320,135 @@ public class MainActivity extends Activity {
             }
         });
         b.show();
+    }
+
+    // Адреса для кнопок-пресетов: набирать цифры на голове неудобно, а промах по цифре
+    // здесь стоит дорого — приложения останутся без резолвинга до следующей правки.
+    private static final String[][] DNS_PRESETS = {
+            {"Google", "8.8.8.8"},
+            {"Cloudflare", "1.1.1.1"},
+            {"AdGuard", "94.140.14.14"},
+            {"Яндекс", "77.88.8.8"},
+    };
+
+    private void addDnsButton() {
+        buttonsRow.addView(button("DNS", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (busy) return;
+                setBusy(true);
+                append("");
+                append("> DNS: читаю настройку...");
+                background(new Runnable() {
+                    @Override
+                    public void run() {
+                        final String out = Keeper.run(MainActivity.this, "--dns", null);
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                setBusy(false);
+                                showDnsDialog(out);
+                            }
+                        });
+                    }
+                });
+            }
+        }));
+    }
+
+    /**
+     * Куда уходят DNS-запросы приложений. Меняется ровно одна вещь — цель DNAT'а на DNS
+     * фантомной TBOX-сети; почему другого места на этой прошивке нет, написано в
+     * wwan-up.sh (функция dns_nat) и docs/app-network.md.
+     */
+    private void showDnsDialog(String status) {
+        String setting = value(status, "dns");
+        String active = value(status, "dns_active");
+        String auto = value(status, "dns_auto");
+        if (setting.isEmpty()) setting = "auto";
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), 0);
+
+        TextView msg = new TextView(this);
+        StringBuilder t = new StringBuilder();
+        t.append("Куда уходят DNS-запросы приложений, пока интернет идёт через модем. ")
+                .append("На Wi-Fi приложения берут DNS роутера — эта настройка их не касается.\n\n");
+        t.append("Сейчас: ").append(active.isEmpty() ? "штатный DNS сети" : active);
+        if (setting.equals("auto")) {
+            t.append("\nНастройка: авто");
+            if (!auto.isEmpty()) t.append(" (оператор даёт ").append(auto).append(')');
+        } else {
+            t.append("\nНастройка: ").append(setting).append(" (задан вручную)");
+        }
+        t.append("\n\nПустое поле = вернуться к DNS оператора.");
+        msg.setText(t.toString());
+        box.addView(msg);
+
+        final android.widget.EditText input = new android.widget.EditText(this);
+        // Именно текстовое поле, а не NUMBER: на цифровой клавиатуре головы точки может
+        // не оказаться вовсе, а адрес без точек не введёшь.
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
+        input.setSingleLine(true);
+        input.setHint("например 1.1.1.1");
+        if (!setting.equals("auto")) input.setText(setting);
+        box.addView(input);
+
+        LinearLayout presets = new LinearLayout(this);
+        presets.setOrientation(LinearLayout.HORIZONTAL);
+        for (String[] p : DNS_PRESETS) {
+            final String addr = p[1];
+            Button b = button(p[0], new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    input.setText(addr);
+                    input.setSelection(addr.length());
+                }
+            });
+            presets.addView(b);
+        }
+        HorizontalScrollView presetsScroll = new HorizontalScrollView(this);
+        presetsScroll.addView(presets);
+        box.addView(presetsScroll);
+
+        new AlertDialog.Builder(this)
+                .setTitle("DNS для приложений")
+                .setView(box)
+                .setPositiveButton("Применить", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        String v = input.getText().toString().trim();
+                        applyDns(v.isEmpty() ? "auto" : v);
+                    }
+                })
+                .setNeutralButton("DNS оператора", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        applyDns("auto");
+                    }
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
+    /**
+     * Похож ли адрес на адрес — решает скрипт (одна проверка на всех, в том числе для
+     * правки wwan.conf руками), его отказ виден в логе на экране. Здесь только защита
+     * командной строки: строка уходит в `sh wwan-up.sh --dns=<...>` через adb-шелл, и
+     * точка с запятой в поле ввода стала бы отдельной командой с правами root.
+     */
+    private void applyDns(final String value) {
+        if (!value.matches("auto|[0-9.]{1,15}")) {
+            append("> DNS: '" + value + "' — в адресе только цифры и точки");
+            return;
+        }
+        runInBackground("> DNS: " + value + "...", new Job() {
+            @Override
+            public void run(Keeper.Progress p) {
+                Keeper.run(MainActivity.this, "--dns=" + value, p);
+            }
+        });
     }
 
     private void stopWatchdog() {

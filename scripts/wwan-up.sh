@@ -23,6 +23,9 @@
 #                           упала именно на загрузке модуля (см. docs/autostart.md)
 #   wwan-up.sh --wifi-prio  только пересчитать приоритет Wi-Fi над модемом в main
 #                           и выйти; молчит, если менять нечего (зовёт watchdog)
+#   wwan-up.sh --dns        показать, какой DNS выдаётся приложениям
+#   wwan-up.sh --dns=1.1.1.1  запомнить кастомный DNS и применить его сейчас
+#   wwan-up.sh --dns=auto   вернуться к DNS оператора/модема (см. docs/app-network.md)
 #
 # Настройки: переменные окружения или /data/local/tmp/wwan.conf (см. wwan.conf.example).
 
@@ -62,12 +65,23 @@ WIFI_METRIC=${WWAN_WIFI_METRIC:-10}
 # Одна — слишком нервно: потерянный пакет или моргнувшая точка доступа не повод
 # уводить трафик на мобильный.
 WIFI_MAX_FAILS=${WWAN_WIFI_MAX_FAILS:-2}
+# Кастомный DNS для приложений. Пусто или auto — как раньше: адрес спрашиваем у
+# модема/оператора. Настройка из wwan.conf/окружения главнее файла state/dns, в
+# который пишет кнопка в приложении: правка руками не должна молча переигрываться
+# кнопкой, нажатой полгода назад.
+# Где это применяется и почему только так — см. dns_nat ниже.
+DNS_SETTING=$STATE/dns
+DNS_AUTO_LAST=$STATE/dns-auto
+DNS_WANT=${WWAN_DNS:-}
+[ -n "$DNS_WANT" ] || DNS_WANT=$(cat "$DNS_SETTING" 2>/dev/null)
 
 CHECK_ONLY=0
 DO_SYSTEM=0
 DO_DOWN=0
 BOOT_MODE=0
 DO_WIFI_PRIO=0
+DO_DNS=0
+DNS_SET=0
 for a in "$@"; do
 	case "$a" in
 	-c | --check)  CHECK_ONLY=1 ;;
@@ -75,7 +89,11 @@ for a in "$@"; do
 	--down)        DO_DOWN=1 ;;
 	--boot)        BOOT_MODE=1 ;;
 	--wifi-prio)   DO_WIFI_PRIO=1 ;;
-	-h | --help)   sed -n '2,30p' "$0"; exit 0 ;;
+	--dns)         DO_DNS=1 ;;
+	# Значение с аргументом главнее и wwan.conf, и файла: человек только что
+	# назвал адрес явно, спорить с ним нечему.
+	--dns=*)       DO_DNS=1; DNS_SET=1; DNS_WANT=${a#--dns=} ;;
+	-h | --help)   sed -n '2,33p' "$0"; exit 0 ;;
 	*) echo "неизвестный аргумент: $a (см. --help)"; exit 64 ;;
 	esac
 done
@@ -544,6 +562,146 @@ dns_answers() {
 	fi
 }
 
+# Похоже на IPv4-адрес. Строгость тут не самоцель, но и «примем что дали» нельзя:
+# строка уходит в командную строку iptables, а сообщить о промахе по цифре надо
+# человеку сразу, а не молча оставить голову без резолвинга.
+is_ipv4() {
+	case "$1" in
+	"" | *[!0-9.]* | *..* | .* | *.) return 1 ;;
+	esac
+	_ip_n=0
+	for _ip_o in $(echo "$1" | tr '.' ' '); do
+		[ "$_ip_o" -ge 0 ] 2>/dev/null && [ "$_ip_o" -le 255 ] 2>/dev/null || return 1
+		_ip_n=$((_ip_n + 1))
+	done
+	[ "$_ip_n" = 4 ]
+}
+
+# Какой адрес станет DNS-сервером приложений: кастомный из настройки, если задан
+# и осмысленный, иначе тот, что нашли у оператора ($1). Заодно запоминаем
+# автоматический — по нему режим --dns умеет вернуться к «как было», не поднимая
+# модем заново и не отбирая AT-порт у pppd.
+dns_pick() {
+	DNS_AUTO=$1
+	[ "$CHECK_ONLY" = 1 ] || [ -z "$DNS_AUTO" ] ||
+		{ mkdir -p "$STATE" 2>/dev/null; echo "$DNS_AUTO" >"$DNS_AUTO_LAST" 2>/dev/null; }
+	case "$DNS_WANT" in
+	"" | auto | AUTO)
+		DNS=$DNS_AUTO
+		DNS_IS_CUSTOM=0 ;;
+	*)
+		if is_ipv4 "$DNS_WANT"; then
+			DNS=$DNS_WANT
+			DNS_IS_CUSTOM=1
+		else
+			warn "кастомный DNS '$DNS_WANT' не похож на IPv4-адрес — беру $DNS_AUTO"
+			DNS=$DNS_AUTO
+			DNS_IS_CUSTOM=0
+		fi ;;
+	esac
+}
+
+# Фантомная TBOX-сеть: блок из машины снят, но Android держит его сеть
+# подключённой, и именно её DNS спрашивают приложения (см. docs/app-network.md).
+tbox_net() {
+	_tn_line=$(dumpsys connectivity 2>/dev/null | grep -m1 'type: Tbox')
+	[ -n "$_tn_line" ] || _tn_line=$(dumpsys connectivity 2>/dev/null | grep -m1 'Transports: CELLULAR')
+	TB_IF=$(echo "$_tn_line" | sed -n 's/.*InterfaceName: \([a-z0-9._-]*\).*/\1/p')
+	TB_DNS=$(echo "$_tn_line" | sed -n 's/.*DnsAddresses: \[ *\/\([0-9.]*\).*/\1/p')
+	TB_IF=${TB_IF:-vlan72}
+	TB_DNS=${TB_DNS:-192.168.72.1}
+	TB_SRC=$(iface_addr "$TB_IF")
+}
+
+# Снять СВОИ ЖЕ DNAT-правила на 53-й порт, которые ведут не туда, куда нужно
+# сейчас. Без этого смена адреса не сработала бы вовсе: правила в цепочке
+# проверяются по порядку, и первым сработало бы старое. Своими считаем ровно
+# DNAT на $TB_DNS:53 — всё прочее в цепочке не наше, про такое только
+# предупреждаем и не трогаем.
+dns_nat_clean() {
+	_keep=$1
+	iptables -w 10 -t nat -S OUTPUT 2>/dev/null |
+		grep -e "-d $TB_DNS/32 " | grep -e "--dport 53 " | grep -e "-j DNAT" |
+		while read -r _rule; do
+			case "$_rule" in
+			*"--to-destination $_keep:53") continue ;;
+			"-A OUTPUT "*) ;;
+			*) continue ;;
+			esac
+			warn "снимаю своё прежнее правило: ${_rule#-A }"
+			# Спецификация правила разбивается на слова намеренно: iptables
+			# ждёт её отдельными аргументами, а не одной строкой.
+			# shellcheck disable=SC2086
+			do_it iptables -w 10 -t nat -D ${_rule#-A }
+		done
+}
+
+# Подменить приложениям DNS-сервер.
+#
+# Точка применения ровно одна, и выбрана она не от хорошей жизни: приложения
+# резолвят через netd, а тот шлёт запросы на DNS-адрес из конфигурации СВОЕЙ сети
+# — фантомной TBOX (на стенде 2026-08-16 счётчик правила показывал 3548 пакетов,
+# то есть весь резолвинг головы идёт именно так). Перенастроить netd нечем:
+# легаси-команды `ndc resolver setnetdns` на этой прошивке нет («Command not
+# recognized»), а «Приватный DNS» — это DoT по имени хоста, IP-адресом его не
+# задать. Перемаршрутизировать тоже нельзя: адрес сервера лежит внутри подсети
+# vlan72/24, и per-host маршрут туда всегда сильнее любого default. Значит —
+# переписывать адрес назначения.
+#
+# MASQUERADE рядом нужен не маршрутам, а этому же пути: запрос уходит с адресом
+# vlan72 (192.168.72.4), и без подмены источника ответ не вернулся бы.
+dns_nat() {
+	_dns=$1
+	if [ -z "$TB_SRC" ]; then
+		warn "у $TB_IF нет адреса — эта сеть сейчас не активна, DNS не трогаю"
+		return 0
+	fi
+	if [ -z "$_dns" ]; then
+		warn "неизвестно, какой DNS ставить приложениям — пропускаю"
+		return 0
+	fi
+	if [ "$TB_DNS" = "$_dns" ]; then
+		skip "DNS приложений и так $TB_DNS — подменять нечего"
+		return 0
+	fi
+	# Автоматический режим уважает живой DNS сети: раз он отвечает, netfilter не
+	# наше дело. Но спрашивать об этом можно, только пока нашего правила нет:
+	# проверка идёт через netd и потому упирается в это же правило, то есть
+	# отвечает «жив» ровно потому, что мы уже перенаправили запросы на живой
+	# сервер (замерено на стенде: с правилом на 8.8.8.8 проверка проходит, хотя
+	# сам 192.168.72.1 не пингуется вовсе). Без этой оговорки возврат `--dns=auto`
+	# молча не сработал бы: проверка прошла бы через кастомное правило и оставила
+	# бы его на месте. Явно названный человеком адрес ставим всегда.
+	_dns_active=$(dns_nat_active)
+	if [ "$DNS_IS_CUSTOM" = 0 ] && [ -z "$_dns_active" ] && dns_answers "$TB_DNS"; then
+		skip "DNS $TB_DNS отвечает сам — netfilter не трогаю"
+		return 0
+	fi
+	# «Уже стоит нужное» отдельной веткой не обрабатываем: ниже всё равно надо
+	# проверить обе строки (udp и tcp) и MASQUERADE, а проверки -C идемпотентны.
+	dns_nat_clean "$_dns"
+	for proto in udp tcp; do
+		iptables -w 10 -t nat -C OUTPUT -d "$TB_DNS" -p $proto --dport 53 \
+			-j DNAT --to-destination "$_dns:53" 2>/dev/null ||
+			do_it iptables -w 10 -t nat -A OUTPUT -d "$TB_DNS" -p $proto --dport 53 \
+				-j DNAT --to-destination "$_dns:53"
+	done
+	iptables -w 10 -t nat -C POSTROUTING -s "$TB_SRC" -o "$WAN_IF" -j MASQUERADE 2>/dev/null ||
+		do_it iptables -w 10 -t nat -A POSTROUTING -s "$TB_SRC" -o "$WAN_IF" -j MASQUERADE
+	if [ "$DNS_IS_CUSTOM" = 1 ]; then
+		ok "DNS приложений: $_dns (задан вручную; было $TB_DNS) через $WAN_IF"
+	else
+		ok "DNS приложений: $_dns (от оператора; было $TB_DNS) через $WAN_IF"
+	fi
+}
+
+# Что сейчас реально стоит в цепочке — для режима --dns и итога.
+dns_nat_active() {
+	iptables -w 10 -t nat -S OUTPUT 2>/dev/null |
+		sed -n "s/^-A OUTPUT -d $TB_DNS\/32 -p udp .*--to-destination \([0-9.]*\):53.*/\1/p" |
+		head -1
+}
+
 # Маршрут по умолчанию через модем в заданную таблицу. У ppp0 маршрут
 # point-to-point (без шлюза), у hilink за интерфейсом настоящий L3-роутер.
 add_default() {
@@ -561,6 +719,46 @@ add_default() {
 # только пересчёт приоритета. Печатает строку, если что-то поменял.
 if [ "$DO_WIFI_PRIO" = 1 ]; then
 	wifi_priority
+	exit 0
+fi
+
+# -------------------------------------------------------------------- --dns --
+# Короткий режим для кнопки в приложении: сохранить адрес и применить его прямо
+# сейчас, на живом соединении. Полный --system сюда не годится — он проверяет
+# модули, порты и дёргает AT, а смена DNS не должна ничего этого стоить.
+if [ "$DO_DNS" = 1 ]; then
+	if [ "$DNS_SET" = 1 ]; then
+		case "$DNS_WANT" in
+		"" | auto | AUTO) DNS_WANT=auto ;;
+		*)
+			is_ipv4 "$DNS_WANT" ||
+				die "'$DNS_WANT' не похож на IPv4-адрес" "настройка не изменена; для возврата к DNS оператора: --dns=auto" ;;
+		esac
+		mkdir -p "$STATE" 2>/dev/null
+		echo "$DNS_WANT" >"$DNS_SETTING" || die "не смог записать $DNS_SETTING" "проверь права на $STATE"
+	fi
+
+	WAN_IF=$(cat "$STATE/wan-iface" 2>/dev/null)
+	tbox_net
+	_dns_auto=$(cat "$DNS_AUTO_LAST" 2>/dev/null)
+	dns_pick "${_dns_auto:-8.8.8.8}"
+
+	say "настройка DNS: ${DNS_WANT:-auto}"
+	if [ -z "$WAN_IF" ] || ! iface_addr "$WAN_IF" >/dev/null 2>&1 || [ -z "$(iface_addr "$WAN_IF")" ]; then
+		# Правило без поднятого модема ставить бессмысленно: заворачивать запросы
+		# некуда, а MASQUERADE не на что вешать. Настройка сохранена — её применит
+		# ближайший подъём (в том числе автозапуск после ребута).
+		warn "модем не поднят — правило поставлю при следующем подъёме"
+	else
+		dns_nat "$DNS"
+	fi
+	_dns_now=$(dns_nat_active)
+	say "сейчас приложения спрашивают: ${_dns_now:-$TB_DNS (штатный DNS сети, правила нет)}"
+	# Машиночитаемо — для кнопки в приложении; формат тот же, что у tbox-icon.sh status.
+	echo "dns=${DNS_WANT:-auto}"
+	echo "dns_active=${_dns_now:-$TB_DNS}"
+	echo "dns_auto=$DNS_AUTO"
+	echo "wan=$WAN_IF"
 	exit 0
 fi
 
@@ -1090,6 +1288,9 @@ if [ "$MODE" = ppp ]; then
 	DNS=${DNS:-8.8.8.8}
 fi
 
+# Найденное выше — это «как отдал оператор»; последнее слово за настройкой.
+dns_pick "$DNS"
+
 # ============================================================== ОБЩЕЕ =======
 stage "маршруты и проверка связи"
 
@@ -1151,16 +1352,16 @@ if [ "$DO_SYSTEM" = 1 ]; then
 	# "призрачную" сотовую сеть (единственную с CELLULAR/INTERNET, когда Wi-Fi
 	# выключен), и таблица vlan72 указывает default на мёртвый шлюз
 	# 192.168.72.1 (постоянная ARP-запись без реального устройства за ней) —
-	# трафик приложений туда просто проваливается. Проверено напрямую:
-	# `ping -m <fwmark-этой-сети> 8.8.8.8` не проходил до этой правки и проходит
-	# после переопределения default в таблице vlan72 на модем.
-	_line=$(dumpsys connectivity 2>/dev/null | grep -m1 'type: Tbox')
-	[ -n "$_line" ] || _line=$(dumpsys connectivity 2>/dev/null | grep -m1 'Transports: CELLULAR')
-	TB_IF=$(echo "$_line" | sed -n 's/.*InterfaceName: \([a-z0-9._-]*\).*/\1/p')
-	TB_DNS=$(echo "$_line" | sed -n 's/.*DnsAddresses: \[ *\/\([0-9.]*\).*/\1/p')
-	TB_IF=${TB_IF:-vlan72}
-	TB_DNS=${TB_DNS:-192.168.72.1}
-	TB_SRC=$(iface_addr "$TB_IF")
+	# трафик приложений туда просто проваливается.
+	#
+	# Насколько эта правка нужна — зависит от прошивки, и на стенде (2026-08-16)
+	# она оказалась лишней: у вендора правило «9999: from all lookup main» стоит
+	# ВЫШЕ fwmark-правил сети (13000/14000), поэтому трафик приложений разрешается
+	# в main и до таблицы vlan72 не доходит вовсе —
+	# `ip route get 8.8.8.8 mark 0x50066` отвечает `dev ppp0`. Интернет приложениям
+	# на этой голове даёт default в main, а не строка ниже. Оставлена как
+	# страховка для голов с другим порядком правил: стоит она одного ip route.
+	tbox_net
 
 	if [ -z "$TB_SRC" ]; then
 		warn "у $TB_IF нет адреса — эта сеть сейчас не активна, пропускаю"
@@ -1171,30 +1372,14 @@ if [ "$DO_SYSTEM" = 1 ]; then
 		ok "таблица $TB_IF: default переключён на $WAN_IF (приложения теперь идут через модем)"
 	fi
 
-	# DNS нужен отдельно от правки таблицы выше: сам сервер 192.168.72.1 лежит
-	# внутри подсети vlan72/24, для него per-host маршрут (scope link) важнее
-	# default и всегда уводит пакет в мёртвый L2 — что бы мы ни клали в default
-	# той же таблицы. Поэтому адрес сервера подменяем DNAT'ом на живой, после
-	# чего пакет уже выходит из подсети и идёт по (исправленному) default.
-	if [ -z "$TB_SRC" ]; then
-		: # уже предупредили выше
-	elif [ "$TB_DNS" = "$DNS" ]; then
-		skip "DNS фантомной сети совпадает с DNS модема — подменять нечего"
-	elif dns_answers "$TB_DNS"; then
-		skip "DNS $TB_DNS уже отвечает — netfilter не трогаю"
-	else
-		_stale=$(iptables -w 10 -t nat -S OUTPUT 2>/dev/null | grep "$TB_DNS" | grep -v "to-destination $DNS:53")
-		[ -n "$_stale" ] && warn "есть старые правила на $TB_DNS, убери вручную: $_stale"
-		for proto in udp tcp; do
-			iptables -w 10 -t nat -C OUTPUT -d "$TB_DNS" -p $proto --dport 53 \
-				-j DNAT --to-destination "$DNS:53" 2>/dev/null ||
-				do_it iptables -w 10 -t nat -A OUTPUT -d "$TB_DNS" -p $proto --dport 53 \
-					-j DNAT --to-destination "$DNS:53"
-		done
-		iptables -w 10 -t nat -C POSTROUTING -s "$TB_SRC" -o "$WAN_IF" -j MASQUERADE 2>/dev/null ||
-			do_it iptables -w 10 -t nat -A POSTROUTING -s "$TB_SRC" -o "$WAN_IF" -j MASQUERADE
-		ok "DNS $TB_DNS ($TB_IF) перенаправлен на $DNS через $WAN_IF"
-	fi
+	# DNS — отдельная история от правки таблицы выше, и, в отличие от неё, вполне
+	# рабочая: сам сервер 192.168.72.1 лежит внутри подсети vlan72/24, для него
+	# per-host маршрут (scope link) важнее default и всегда уводит пакет в мёртвый
+	# L2 — что бы мы ни клали в default какой угодно таблицы. Поэтому адрес
+	# подменяем DNAT'ом на живой, после чего пакет выходит из подсети и идёт
+	# наружу обычным путём. Здесь же применяется кастомный DNS — подробности,
+	# почему другого места для него нет, в комментарии к dns_nat.
+	dns_nat "$DNS"
 
 	# Признак, который реально видят приложения (не заглядывая внутрь netd):
 	# ConnectivityService перепроверяет валидацию не мгновенно — сразу после
@@ -1214,6 +1399,13 @@ say "== итог"
 say "   тип:       $MODE"
 say "   $WAN_IF:      ${ADDR:-не поднят}"
 say "   маршрут:   $(ip route show table "$TABLE" 2>/dev/null | head -1)"
+if [ "$DO_SYSTEM" = 1 ]; then
+	if [ "$DNS_IS_CUSTOM" = 1 ]; then
+		say "   DNS:       $DNS (задан вручную)"
+	else
+		say "   DNS:       $DNS (от оператора)"
+	fi
+fi
 if [ "$CHECK_ONLY" = 0 ] && [ -n "$ADDR" ]; then
 	if timeout 10 ping -c 1 -W 5 -I "$WAN_IF" 8.8.8.8 >/dev/null 2>&1; then
 		say "   интернет:  есть"
