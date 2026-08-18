@@ -54,7 +54,7 @@ public class MainActivity extends Activity {
         buttonsRow = new LinearLayout(this);
         buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
         addRunButton("Проверка", "--check");
-        addRunButton("Включить", "--system");
+        addEnableButton();
         addRunButton("Выключить", "--down");
         addAutostartButton();
         addIconButton();
@@ -90,6 +90,27 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------ кнопки --
+
+    private void addEnableButton() {
+        buttonsRow.addView(button("Включить", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                runInBackground("> Включить ...", new Job() {
+                    @Override
+                    public void run(Keeper.Progress p) {
+                        Keeper.run(MainActivity.this, "--system", p);
+                        if (Autostart.isEnabled(MainActivity.this)) {
+                            String st = Keeper.runBoot(MainActivity.this, "--status", null);
+                            if (!st.contains("watchdog=1")) {
+                                p.onLine("\n> автозапуск включен — запускаю сторожа (wwan-boot.sh)...");
+                                Keeper.startAutostart(MainActivity.this, true, p);
+                            }
+                        }
+                    }
+                });
+            }
+        }));
+    }
 
     private void addRunButton(String text, final String args) {
         buttonsRow.addView(button(text, new View.OnClickListener() {

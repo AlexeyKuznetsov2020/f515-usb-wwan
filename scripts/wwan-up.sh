@@ -82,18 +82,20 @@ BOOT_MODE=0
 DO_WIFI_PRIO=0
 DO_DNS=0
 DNS_SET=0
+DO_RECONNECT=0
 for a in "$@"; do
 	case "$a" in
-	-c | --check)  CHECK_ONLY=1 ;;
-	-s | --system) DO_SYSTEM=1 ;;
-	--down)        DO_DOWN=1 ;;
-	--boot)        BOOT_MODE=1 ;;
-	--wifi-prio)   DO_WIFI_PRIO=1 ;;
-	--dns)         DO_DNS=1 ;;
+	-c | --check)     CHECK_ONLY=1 ;;
+	-s | --system)    DO_SYSTEM=1 ;;
+	-r | --reconnect) DO_RECONNECT=1 ;;
+	--down)           DO_DOWN=1 ;;
+	--boot)           BOOT_MODE=1 ;;
+	--wifi-prio)      DO_WIFI_PRIO=1 ;;
+	--dns)            DO_DNS=1 ;;
 	# Значение с аргументом главнее и wwan.conf, и файла: человек только что
 	# назвал адрес явно, спорить с ним нечему.
-	--dns=*)       DO_DNS=1; DNS_SET=1; DNS_WANT=${a#--dns=} ;;
-	-h | --help)   sed -n '2,33p' "$0"; exit 0 ;;
+	--dns=*)          DO_DNS=1; DNS_SET=1; DNS_WANT=${a#--dns=} ;;
+	-h | --help)      sed -n '2,33p' "$0"; exit 0 ;;
 	*) echo "неизвестный аргумент: $a (см. --help)"; exit 64 ;;
 	esac
 done
@@ -342,15 +344,36 @@ wifi_online() {
 			http://connectivitycheck.gstatic.com/generate_204 2>/dev/null)" = "204" ] &&
 			return 0
 	fi
-	ping -c 1 -W 3 -I "$1" 8.8.8.8 >/dev/null 2>&1
+	timeout 5 ping -c 1 -W 3 -I "$1" 8.8.8.8 >/dev/null 2>&1
 }
 
 # Печатает строку и возвращает 0, ТОЛЬКО если что-то изменил: функцию дёргает
 # watchdog раз в минуту, и молчание — нормальное состояние.
 wifi_priority() {
-	_wp_if=$(wifi_iface) || return 1
-	_wp_gw=$(wifi_gw "$_wp_if")
-	[ -n "$_wp_gw" ] || return 1
+	_wp_if=$(wifi_iface) || _wp_if=""
+	_wp_gw=$([ -n "$_wp_if" ] && wifi_gw "$_wp_if" || echo "")
+
+	# Если Wi-Fi интерфейса нет или у него нет шлюза (сеть отключена):
+	if [ -z "$_wp_if" ] || [ -z "$_wp_gw" ]; then
+		wifi_fails_set 0
+		# Удаляем любые зависшие маршруты default через wlan* в main
+		_stale_wifi=$(ip route show table main 2>/dev/null | grep '^default.* dev wlan')
+		if [ -n "$_stale_wifi" ]; then
+			if [ "$CHECK_ONLY" = 1 ]; then
+				echo "Wi-Fi отключён — устаревший маршрут в main был бы удалён"
+				return 0
+			fi
+			for _g in $(echo "$_stale_wifi" | sed -n 's/^default via \([0-9.]*\).*/\1/p'); do
+				ip route del default via "$_g" table main 2>/dev/null || true
+			done
+			ip route del default dev wlan0 table main 2>/dev/null || true
+			ip route del default dev wlan1 table main 2>/dev/null || true
+			echo "Wi-Fi отключён — устаревший default удалён из main, приоритет у модема"
+			return 0
+		fi
+		return 1
+	fi
+
 	_wp_have=$(ip route show table main 2>/dev/null |
 		grep "^default via $_wp_gw dev $_wp_if ")
 
@@ -1009,7 +1032,7 @@ else
 	say "   видимые USB-устройства:"
 	for d in /sys/bus/usb/devices/*; do
 		[ -f "$d/idVendor" ] || continue
-		say "      $(basename "$d")  $(cat "$d/idVendor"):$(cat "$d/idProduct" 2>/dev/null)" \
+		say "      $(basename "$d")  $(cat "$d/idVendor" 2>/dev/null):$(cat "$d/idProduct" 2>/dev/null)" \
 			"\"$(cat "$d/product" 2>/dev/null)\""
 	done
 	say "   сетевые интерфейсы:"
@@ -1025,9 +1048,17 @@ fi
 if [ "$MODE" = hilink ]; then
 	WAN_IF=$HILINK_IF
 
+	if [ "$DO_RECONNECT" = 1 ] && [ "$CHECK_ONLY" = 0 ]; then
+		say "   [reconnect] сброс сетевого интерфейса $WAN_IF..."
+		ip link set "$WAN_IF" down 2>/dev/null || true
+		sleep 1
+		ADDR=""
+		GW=""
+	fi
+
 	stage "адрес по DHCP на $WAN_IF"
 	ADDR=$(iface_addr "$WAN_IF")
-	if [ -n "$ADDR" ]; then
+	if [ "$DO_RECONNECT" = 0 ] && [ -n "$ADDR" ]; then
 		skip "$WAN_IF уже с адресом: $ADDR"
 	elif [ "$CHECK_ONLY" = 1 ]; then
 		say "   [dry ] ip link set $WAN_IF up + udhcpc"
@@ -1166,7 +1197,25 @@ if [ "$MODE" = ppp ]; then
 	fi
 
 	stage "SIM и регистрация в сети"
-	if pidof pppd >/dev/null 2>&1; then
+	if [ "$DO_RECONNECT" = 1 ] && [ "$CHECK_ONLY" = 0 ]; then
+		_pids=$(pidof pppd 2>/dev/null)
+		if [ -n "$_pids" ]; then
+			say "   [reconnect] останавливаю старый pppd (pid $_pids)..."
+			kill $_pids 2>/dev/null
+			sleep 1
+			pidof pppd >/dev/null 2>&1 && kill -9 $(pidof pppd) 2>/dev/null
+			sleep 1
+		fi
+		# Чистим старые ip rule для прежних адресов
+		for _rip in $(ip rule show 2>/dev/null | grep -E 'lookup (99|legacy_system)' | grep 'from ' | grep -v 'from all' | awk '{print $3}'); do
+			case "$_rip" in
+			10.* | 192.168.* | 172.*) ip rule del from "$_rip" 2>/dev/null || true ;;
+			esac
+		done
+		ADDR=""
+	fi
+
+	if [ "$DO_RECONNECT" = 0 ] && pidof pppd >/dev/null 2>&1; then
 		skip "pppd уже держит порт — AT-опрос пропускаем"
 	elif [ "$CHECK_ONLY" = 1 ] && [ ! -c "${CTRL_TTY:-/dev/null}" ]; then
 		skip "нет управляющего порта"
@@ -1262,7 +1311,7 @@ if [ "$MODE" = ppp ]; then
 
 	stage "дозвон"
 	ADDR=$(iface_addr ppp0)
-	if [ -n "$ADDR" ]; then
+	if [ "$DO_RECONNECT" = 0 ] && [ -n "$ADDR" ]; then
 		skip "ppp0 уже поднят: $ADDR"
 	elif [ "$CHECK_ONLY" = 1 ]; then
 		say "   [dry ] pppd $MODEM_TTY ... connect $DIAL_SH"
@@ -1465,6 +1514,9 @@ if [ "$CHECK_ONLY" = 0 ] && [ -n "$ADDR" ]; then
 		say "   интернет:  есть"
 	else
 		say "   интернет:  ping не проходит (см. предупреждения выше)"
+		if [ "$DO_RECONNECT" = 1 ]; then
+			exit 1
+		fi
 	fi
 fi
 say "   лог:       $LOG"
