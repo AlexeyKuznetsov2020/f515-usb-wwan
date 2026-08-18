@@ -187,7 +187,7 @@ find_hilink_iface() {
 		*) continue ;;
 		esac
 		case "$(basename "$drv")" in
-		cdc_ether | rndis_host* | cdc_ncm | huawei_cdc_ncm)
+		cdc_ether | rndis_host* | f515_rndis | cdc_ncm | huawei_cdc_ncm)
 			HILINK_IF=$(basename "$d")
 			HILINK_DRV=$(basename "$drv")
 			return 0 ;;
@@ -966,14 +966,14 @@ elif ! find_rndis_iface; then
 	skip "RNDIS-устройств на шине нет — стадия не нужна"
 else
 	ok "RNDIS-интерфейс $(basename "$RNDIS_IF") ($RNDIS_ID)"
-	RNDISDIR=$(mod_dir rndis_host.ko)
-	[ -f "$RNDISDIR/rndis_host.ko" ] || die "нет файла $RNDISDIR/rndis_host.ko" \
-		"положи modules/prebuilt/rndis_host.ko в $TMP или собери: modules/build-cfi.sh src/rndis"
-	load_module "$RNDISDIR/rndis_host.ko" rndis_host /sys/bus/usb/drivers/rndis_host
+	RNDISDIR=$(mod_dir f515_rndis.ko)
+	[ -f "$RNDISDIR/f515_rndis.ko" ] || die "нет файла $RNDISDIR/f515_rndis.ko" \
+		"положи modules/prebuilt/f515_rndis.ko в $TMP или собери: modules/build-cfi.sh src/rndis"
+	load_module "$RNDISDIR/f515_rndis.ko" f515_rndis /sys/bus/usb/drivers/f515_rndis
 
 	_i=$(basename "$RNDIS_IF")
-	if [ -e "/sys/bus/usb/drivers/rndis_host" ] && [ ! -e "$RNDIS_IF/driver" ]; then
-		do_it sh -c "printf %s $_i >/sys/bus/usb/drivers/rndis_host/bind 2>/dev/null" || true
+	if [ -e "/sys/bus/usb/drivers/f515_rndis" ] && [ ! -e "$RNDIS_IF/driver" ]; then
+		do_it sh -c "printf %s $_i >/sys/bus/usb/drivers/f515_rndis/bind 2>/dev/null" || true
 	fi
 
 	if [ "$CHECK_ONLY" = 0 ]; then
@@ -983,8 +983,8 @@ else
 			sleep 1
 			i=$((i + 1))
 		done
-		find_hilink_iface || die "модуль rndis_host загружен, а сетевой интерфейс не появился" \
-			"смотри dmesg на предмет rndis_host"
+		find_hilink_iface || die "модуль f515_rndis загружен, а сетевой интерфейс не появился" \
+			"смотри dmesg на предмет f515_rndis"
 		ok "сетевой интерфейс $HILINK_IF (драйвер $HILINK_DRV)"
 	fi
 fi

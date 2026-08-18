@@ -1,1 +1,1 @@
-obj-m += rndis_host.o
+obj-m += f515_rndis.o

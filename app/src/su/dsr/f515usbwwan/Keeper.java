@@ -55,7 +55,7 @@ public class Keeper {
             {"cdc-wdm.ko", "cdc-wdm.ko", Boolean.FALSE},
             {"cdc_ncm.ko", "cdc_ncm.ko", Boolean.FALSE},
             {"huawei_cdc_ncm.ko", "huawei_cdc_ncm.ko", Boolean.FALSE},
-            {"rndis_host.ko", "rndis_host.ko", Boolean.FALSE},
+            {"f515_rndis.ko", "f515_rndis.ko", Boolean.FALSE},
     };
 
     private static final Object LOCK = new Object();
