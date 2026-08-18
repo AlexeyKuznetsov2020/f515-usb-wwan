@@ -17,7 +17,7 @@ set -e
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=${KDIR:?"укажи KDIR=/путь/к/исходникам/ядра"}
-MOD=${1:?"использование: build-cfi.sh <каталог-внешнего-модуля>"}
+MOD=$(cd "${1:?"использование: build-cfi.sh <каталог-внешнего-модуля>"}" && pwd)
 RUNNING_CONFIG=${RUNNING_CONFIG:-$HERE/running.config}
 TOOLCHAIN_BIN=${TOOLCHAIN_BIN:-$HERE/llvm-bin}
 SYMVERS=${SYMVERS:-$HERE/oem.symvers}

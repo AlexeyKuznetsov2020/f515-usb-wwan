@@ -24,7 +24,8 @@ for f in "$ROOT"/scripts/wwan-up.sh "$ROOT"/scripts/wwan-boot.sh \
          "$ROOT"/tools/huawei-modeswitch \
          "$ROOT"/modules/prebuilt/usbserialmerged2.ko "$ROOT"/modules/prebuilt/ppp_async.ko \
          "$ROOT"/modules/prebuilt/cdc-wdm.ko "$ROOT"/modules/prebuilt/cdc_ncm.ko \
-         "$ROOT"/modules/prebuilt/huawei_cdc_ncm.ko; do
+         "$ROOT"/modules/prebuilt/huawei_cdc_ncm.ko \
+         "$ROOT"/modules/prebuilt/rndis_host.ko; do
     case "$f" in
     # Чекаут под Windows (core.autocrlf=true) отдаёт скрипты с CRLF, а
     # /system/bin/sh на голове давится на \r - нормализуем при копировании.

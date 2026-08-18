@@ -187,7 +187,7 @@ find_hilink_iface() {
 		*) continue ;;
 		esac
 		case "$(basename "$drv")" in
-		cdc_ether | rndis_host | cdc_ncm | huawei_cdc_ncm)
+		cdc_ether | rndis_host* | cdc_ncm | huawei_cdc_ncm)
 			HILINK_IF=$(basename "$d")
 			HILINK_DRV=$(basename "$drv")
 			return 0 ;;
@@ -233,6 +233,24 @@ find_ncm_iface() {
 		NCM_IF=$i
 		NCM_ID="ff/$_sc/$_pr"
 		return 0
+	done
+	return 1
+}
+
+# RNDIS-интерфейс (MTS 81332FT / ZTE MF90 / Marvell PXA1802 и любые другие RNDIS-устройства):
+# класс wireless (e0/01/03) или comm (02/02/ff).
+find_rndis_iface() {
+	for i in /sys/bus/usb/devices/*:*; do
+		[ -f "$i/bInterfaceClass" ] || continue
+		_cl=$(cat "$i/bInterfaceClass" 2>/dev/null)
+		_sc=$(cat "$i/bInterfaceSubClass" 2>/dev/null)
+		_pr=$(cat "$i/bInterfaceProtocol" 2>/dev/null)
+		case "$_cl:$_sc:$_pr" in
+		e0:01:03 | 02:02:ff)
+			RNDIS_IF=$i
+			RNDIS_ID="$_cl/$_sc/$_pr"
+			return 0 ;;
+		esac
 	done
 	return 1
 }
@@ -931,6 +949,37 @@ else
 		done
 		find_hilink_iface || die "модули загружены, а сетевой интерфейс не появился" \
 			"смотри dmesg на предмет huawei_cdc_ncm/cdc_ncm: интерфейс мог остаться за option"
+		ok "сетевой интерфейс $HILINK_IF (драйвер $HILINK_DRV)"
+	fi
+fi
+
+# --------------------------------------------------------- RNDIS -----------
+# RNDIS-устройства (MTS 81332FT / ZTE MF90 и аналоги) отдают сетевой интерфейс
+# через класс e0/01/03 (Wireless Controller / RNDIS) или 02/02/ff. В ядре головы
+# CONFIG_USB_NET_RNDIS_HOST выключен, поэтому подвозим rndis_host.ko модулем.
+stage "RNDIS-интерфейс"
+if [ "${WWAN_MODE:-}" = ppp ]; then
+	skip "задан WWAN_MODE=ppp — RNDIS не трогаем"
+elif find_hilink_iface; then
+	skip "сетевой интерфейс модема уже есть ($HILINK_IF, драйвер $HILINK_DRV)"
+elif ! find_rndis_iface; then
+	skip "RNDIS-устройств на шине нет — стадия не нужна"
+else
+	ok "RNDIS-интерфейс $(basename "$RNDIS_IF") ($RNDIS_ID)"
+	RNDISDIR=$(mod_dir rndis_host.ko)
+	[ -f "$RNDISDIR/rndis_host.ko" ] || die "нет файла $RNDISDIR/rndis_host.ko" \
+		"положи modules/prebuilt/rndis_host.ko в $TMP или собери: modules/build-cfi.sh src/rndis"
+	load_module "$RNDISDIR/rndis_host.ko" rndis_host /sys/bus/usb/drivers/rndis_host
+
+	if [ "$CHECK_ONLY" = 0 ]; then
+		i=0
+		while [ $i -lt 10 ]; do
+			find_hilink_iface && break
+			sleep 1
+			i=$((i + 1))
+		done
+		find_hilink_iface || die "модуль rndis_host загружен, а сетевой интерфейс не появился" \
+			"смотри dmesg на предмет rndis_host"
 		ok "сетевой интерфейс $HILINK_IF (драйвер $HILINK_DRV)"
 	fi
 fi
