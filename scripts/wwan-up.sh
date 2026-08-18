@@ -971,6 +971,11 @@ else
 		"положи modules/prebuilt/rndis_host.ko в $TMP или собери: modules/build-cfi.sh src/rndis"
 	load_module "$RNDISDIR/rndis_host.ko" rndis_host /sys/bus/usb/drivers/rndis_host
 
+	_i=$(basename "$RNDIS_IF")
+	if [ -e "/sys/bus/usb/drivers/rndis_host" ] && [ ! -e "$RNDIS_IF/driver" ]; then
+		do_it sh -c "printf %s $_i >/sys/bus/usb/drivers/rndis_host/bind 2>/dev/null" || true
+	fi
+
 	if [ "$CHECK_ONLY" = 0 ]; then
 		i=0
 		while [ $i -lt 10 ]; do
