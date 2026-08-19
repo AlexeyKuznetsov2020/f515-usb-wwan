@@ -59,6 +59,7 @@ public class MainActivity extends Activity {
         addAutostartButton();
         addIconButton();
         addDnsButton();
+        addUpdateButton();
         addUrlButton("Интернетометр", SPEEDTEST_URL);
         addFormatButton();
         HorizontalScrollView buttonsScroll = new HorizontalScrollView(this);
@@ -375,6 +376,85 @@ public class MainActivity extends Activity {
                 });
             }
         }));
+    }
+
+    private void addUpdateButton() {
+        buttonsRow.addView(button("Обновить", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (busy) return;
+                setBusy(true);
+                append("");
+                append("> Проверка обновлений на GitHub...");
+                UpdateManager.check(MainActivity.this, new UpdateManager.CheckCallback() {
+                    @Override
+                    public void onResult(final boolean hasUpdate, final UpdateManager.ReleaseInfo release, final String currentVersion, final String message) {
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                setBusy(false);
+                                append(message);
+                                if (hasUpdate) {
+                                    showUpdateDialog(release, currentVersion);
+                                }
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onError(final String error) {
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                setBusy(false);
+                                append("ERROR: " + error);
+                            }
+                        });
+                    }
+                });
+            }
+        }));
+    }
+
+    private void showUpdateDialog(final UpdateManager.ReleaseInfo release, String currentVer) {
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle("Доступно обновление: " + release.tagName);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Текущая версия: v").append(currentVer).append("\n");
+        sb.append("Новая версия: ").append(release.tagName).append("\n\n");
+        if (release.body != null && !release.body.trim().isEmpty()) {
+            sb.append("Что нового:\n").append(release.body.trim()).append("\n\n");
+        }
+        sb.append("Установить обновление сейчас?");
+        b.setMessage(sb.toString());
+
+        b.setPositiveButton("Установить", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                setBusy(true);
+                append("");
+                append("> Запуск процесса обновления...");
+                UpdateManager.downloadAndInstall(MainActivity.this, release, new Keeper.Progress() {
+                    @Override
+                    public void onLine(final String line) {
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                append(line);
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        b.setNegativeButton("Позже", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                dialog.dismiss();
+            }
+        });
+        b.show();
     }
 
     /**
