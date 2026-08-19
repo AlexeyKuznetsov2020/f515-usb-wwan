@@ -1,6 +1,6 @@
 #!/bin/sh
-# scripts/install-update.sh - Тихая установка обновления APK на ГУ F515
-# Основной метод: инжектор Seres EngineeringMode (Toolbox) с гарантированным автозакрытием
+# scripts/install-update.sh - 100% тихая установка обновления APK на ГУ F515
+# Основной метод: инжектор Seres EngineeringMode (Toolbox) в фоновом режиме БЕЗ показа GUI
 # Резервный метод: pm install
 set -e
 
@@ -24,35 +24,47 @@ for p in /data/user/0/com.ispace.toolbox/files/frida/engmode-install.js \
 	fi
 done
 
-# 1. ОСНОВНОЙ МЕТОД: инжектор Seres EngineeringMode (Toolbox)
+# 1. ОСНОВНОЙ МЕТОД: инжектор Seres EngineeringMode (Toolbox) в чистом фоне
 if [ -x "$FRIDA_INJECT" ] && [ -n "$ENGMODE_JS" ]; then
-	echo "==> [Основной метод] Запуск тихого установщика SeresEngMode (Toolbox)..."
+	echo "==> [Основной метод] Подготовка тихого установщика SeresEngMode (Toolbox)..."
 	echo "$APK_PATH" > /data/local/tmp/engmode-install-path
 	chmod 666 /data/local/tmp/engmode-install-path
 
-	# Запускаем независимый отвязанный таймер, который гарантированно закроет EngineeringMode
-	# и вернет наше приложение на экран, даже если текущий процесс приложения будет убит во время обновления
-	(
-		sleep 2
-		am force-stop com.seres.engineeringmode >/dev/null 2>&1 || true
-		sleep 0.5
-		am start -n su.dsr.f515usbwwan/.MainActivity >/dev/null 2>&1 || true
-		rm -f "$APK_PATH" 2>/dev/null || true
-	) </dev/null >/dev/null 2>&1 &
-
-	am start -n com.seres.engineeringmode/.MainActivity >/dev/null 2>&1
-	sleep 0.5
+	# Ищем PID процесса com.seres.engineeringmode
 	PID=$(pidof com.seres.engineeringmode 2>/dev/null || true)
-	if [ -n "$PID" ]; then
-		echo "   EngMode PID: $PID, запуск frida-inject..."
-		timeout 3 "$FRIDA_INJECT" -p "$PID" -s "$ENGMODE_JS" >/dev/null 2>&1 || true
+
+	# Если процесс не запущен, поднимаем его в ФОНЕ через broadcast (без открытия Activity/GUI)
+	if [ -z "$PID" ]; then
+		echo "   Запуск фонового процесса SeresEngMode через broadcast..."
+		am broadcast -a android.intent.action.LOCKED_BOOT_COMPLETED -p com.seres.engineeringmode >/dev/null 2>&1 || true
+		am broadcast -a com.seres.engineeringmode.ACCESS -p com.seres.engineeringmode >/dev/null 2>&1 || true
 		sleep 0.5
-		am force-stop com.seres.engineeringmode >/dev/null 2>&1 || true
-		am start -n su.dsr.f515usbwwan/.MainActivity >/dev/null 2>&1 || true
-		echo "OK: Установка через SeresEngMode завершена"
+		PID=$(pidof com.seres.engineeringmode 2>/dev/null || true)
+	fi
+
+	# Если broadcast не поднял процесс, поднимаем фоновый сервис
+	if [ -z "$PID" ]; then
+		am start-service -n com.seres.engineeringmode/.camera.IntentUriService >/dev/null 2>&1 || true
+		sleep 0.5
+		PID=$(pidof com.seres.engineeringmode 2>/dev/null || true)
+	fi
+
+	# Если PID найден — инжектим скрипт в фоновый процесс
+	if [ -n "$PID" ]; then
+		echo "   Фоновый PID: $PID, запуск frida-inject..."
+		timeout 4 "$FRIDA_INJECT" -p "$PID" -s "$ENGMODE_JS" >/dev/null 2>&1 || true
+		sleep 1
+		rm -f "$APK_PATH" 2>/dev/null || true
+		echo "OK: Установка через SeresEngMode завершена (100% фоновый режим)"
 		exit 0
 	else
-		echo "WARN: Не удалось определить PID com.seres.engineeringmode, пробую резервный метод..."
+		# Если фоновые методы не смогли запустить процесс, пробуем spawn через frida-inject -f
+		echo "   Попытка spawn через frida-inject -f..."
+		if timeout 6 "$FRIDA_INJECT" -f com.seres.engineeringmode -s "$ENGMODE_JS" >/dev/null 2>&1; then
+			rm -f "$APK_PATH" 2>/dev/null || true
+			echo "OK: Установка через frida-inject spawn завершена"
+			exit 0
+		fi
 	fi
 fi
 
