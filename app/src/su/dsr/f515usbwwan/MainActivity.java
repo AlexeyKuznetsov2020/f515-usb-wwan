@@ -33,6 +33,9 @@ public class MainActivity extends Activity {
 
     private TextView log;
     private LinearLayout buttonsRow;
+    private TextView tvVersion;
+    private Button btnUpdate;
+    private UpdateManager.ReleaseInfo latestRelease;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private boolean busy = false;
 
@@ -45,11 +48,29 @@ public class MainActivity extends Activity {
         root.setPadding(24, 24, 24, 24);
         root.setBackgroundColor(Color.BLACK);
 
-        TextView version = new TextView(this);
-        version.setText("F515 USB WWAN " + versionName());
-        version.setTextColor(Color.GRAY);
-        version.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        root.addView(version);
+        // Шапка: название, текущая версия + статус версии на сервере и кнопка «Обновить»
+        LinearLayout headerRow = new LinearLayout(this);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        headerRow.setPadding(0, 0, 0, dp(10));
+
+        tvVersion = new TextView(this);
+        tvVersion.setText("F515 USB WWAN v" + versionName() + "  [проверка обновления...]");
+        tvVersion.setTextColor(Color.LTGRAY);
+        tvVersion.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams vLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f);
+        headerRow.addView(tvVersion, vLp);
+
+        btnUpdate = button("Обновить", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onUpdateClicked();
+            }
+        });
+        btnUpdate.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        headerRow.addView(btnUpdate);
+
+        root.addView(headerRow);
 
         buttonsRow = new LinearLayout(this);
         buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -59,7 +80,6 @@ public class MainActivity extends Activity {
         addAutostartButton();
         addIconButton();
         addDnsButton();
-        addUpdateButton();
         addUrlButton("Интернетометр", SPEEDTEST_URL);
         addFormatButton();
         HorizontalScrollView buttonsScroll = new HorizontalScrollView(this);
@@ -85,9 +105,9 @@ public class MainActivity extends Activity {
         append("Выключить     - остановить pppd");
         append("Автозапуск    - подъём после перезагрузки головы + слежение за связью");
         append("Интернетометр - открыть " + SPEEDTEST_URL + " (проверка интернета глазами)");
-        append("Форматировать SD - выбрать и стереть SD/TF-карту (необратимо)");
-        append("");
         append("автозапуск сейчас: " + (Autostart.isEnabled(this) ? "ВКЛЮЧЕН" : "выключен"));
+
+        checkServerVersionAsync();
     }
 
     // ------------------------------------------------------------------ кнопки --
@@ -378,42 +398,84 @@ public class MainActivity extends Activity {
         }));
     }
 
-    private void addUpdateButton() {
-        buttonsRow.addView(button("Обновить", new View.OnClickListener() {
+    private void checkServerVersionAsync() {
+        tvVersion.setText("F515 USB WWAN v" + versionName() + "  [проверка обновления...]");
+        UpdateManager.check(this, new UpdateManager.CheckCallback() {
             @Override
-            public void onClick(View v) {
-                if (busy) return;
-                setBusy(true);
-                append("");
-                append("> Проверка обновлений на GitHub...");
-                UpdateManager.check(MainActivity.this, new UpdateManager.CheckCallback() {
+            public void onResult(final boolean hasUpdate, final UpdateManager.ReleaseInfo release, final String currentVersion, final String message) {
+                ui.post(new Runnable() {
                     @Override
-                    public void onResult(final boolean hasUpdate, final UpdateManager.ReleaseInfo release, final String currentVersion, final String message) {
-                        ui.post(new Runnable() {
-                            @Override
-                            public void run() {
-                                setBusy(false);
-                                append(message);
-                                if (hasUpdate) {
-                                    showUpdateDialog(release, currentVersion);
-                                }
-                            }
-                        });
-                    }
-
-                    @Override
-                    public void onError(final String error) {
-                        ui.post(new Runnable() {
-                            @Override
-                            public void run() {
-                                setBusy(false);
-                                append("ERROR: " + error);
-                            }
-                        });
+                    public void run() {
+                        latestRelease = release;
+                        if (hasUpdate) {
+                            tvVersion.setText("F515 USB WWAN v" + currentVersion + "  →  " + release.tagName + " доступна!");
+                            tvVersion.setTextColor(Color.parseColor("#4CAF50"));
+                            btnUpdate.setTextColor(Color.parseColor("#FFD700"));
+                        } else {
+                            tvVersion.setText("F515 USB WWAN v" + currentVersion + "  (на сервере: " + release.tagName + " — актуально)");
+                            tvVersion.setTextColor(Color.LTGRAY);
+                            btnUpdate.setTextColor(Color.LTGRAY);
+                        }
                     }
                 });
             }
-        }));
+
+            @Override
+            public void onError(final String error) {
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        tvVersion.setText("F515 USB WWAN v" + versionName() + "  (сервер недоступен)");
+                        tvVersion.setTextColor(Color.GRAY);
+                    }
+                });
+            }
+        });
+    }
+
+    private void onUpdateClicked() {
+        if (busy) return;
+        if (latestRelease != null && UpdateManager.isVersionNewer(latestRelease.versionName, versionName())) {
+            showUpdateDialog(latestRelease, versionName());
+            return;
+        }
+        setBusy(true);
+        append("");
+        append("> Проверка обновлений на GitHub...");
+        UpdateManager.check(this, new UpdateManager.CheckCallback() {
+            @Override
+            public void onResult(final boolean hasUpdate, final UpdateManager.ReleaseInfo release, final String currentVersion, final String message) {
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        latestRelease = release;
+                        append(message);
+                        if (hasUpdate) {
+                            tvVersion.setText("F515 USB WWAN v" + currentVersion + "  →  " + release.tagName + " доступна!");
+                            tvVersion.setTextColor(Color.parseColor("#4CAF50"));
+                            btnUpdate.setTextColor(Color.parseColor("#FFD700"));
+                            showUpdateDialog(release, currentVersion);
+                        } else {
+                            tvVersion.setText("F515 USB WWAN v" + currentVersion + "  (на сервере: " + release.tagName + " — актуально)");
+                            tvVersion.setTextColor(Color.LTGRAY);
+                            btnUpdate.setTextColor(Color.LTGRAY);
+                        }
+                    }
+                });
+            }
+
+            @Override
+            public void onError(final String error) {
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        append("ERROR: " + error);
+                    }
+                });
+            }
+        });
     }
 
     private void showUpdateDialog(final UpdateManager.ReleaseInfo release, String currentVer) {
