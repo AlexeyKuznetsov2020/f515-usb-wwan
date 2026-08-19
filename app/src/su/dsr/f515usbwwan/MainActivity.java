@@ -472,6 +472,8 @@ public class MainActivity extends Activity {
         if (release.body != null && !release.body.trim().isEmpty()) {
             sb.append("Что нового:\n").append(release.body.trim()).append("\n\n");
         }
+        sb.append("После скачивания приложение закроется.\n");
+        sb.append("Дождитесь сообщения «Успешная установка» и после этого откройте приложение.\n\n");
         sb.append("Установить обновление сейчас?");
         b.setMessage(sb.toString());
 
