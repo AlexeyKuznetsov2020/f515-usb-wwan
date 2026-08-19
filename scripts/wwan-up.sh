@@ -74,6 +74,7 @@ DNS_SETTING=$STATE/dns
 DNS_AUTO_LAST=$STATE/dns-auto
 DNS_WANT=${WWAN_DNS:-}
 [ -n "$DNS_WANT" ] || DNS_WANT=$(cat "$DNS_SETTING" 2>/dev/null)
+CHECK_HOST=${WWAN_CHECK_HOST:-77.88.8.8}
 
 CHECK_ONLY=0
 DO_SYSTEM=0
@@ -344,7 +345,7 @@ wifi_online() {
 			http://connectivitycheck.gstatic.com/generate_204 2>/dev/null)" = "204" ] &&
 			return 0
 	fi
-	timeout 5 ping -c 1 -W 3 -I "$1" 8.8.8.8 >/dev/null 2>&1
+	timeout 5 ping -c 1 -W 3 -I "$1" "$CHECK_HOST" >/dev/null 2>&1
 }
 
 # Печатает строку и возвращает 0, ТОЛЬКО если что-то изменил: функцию дёргает
@@ -782,7 +783,7 @@ if [ "$DO_DNS" = 1 ]; then
 	WAN_IF=$(cat "$STATE/wan-iface" 2>/dev/null)
 	tbox_net
 	_dns_auto=$(cat "$DNS_AUTO_LAST" 2>/dev/null)
-	dns_pick "${_dns_auto:-8.8.8.8}"
+	dns_pick "${_dns_auto:-$CHECK_HOST}"
 
 	say "настройка DNS: ${DNS_WANT:-auto}"
 	if [ -z "$WAN_IF" ] || ! iface_addr "$WAN_IF" >/dev/null 2>&1 || [ -z "$(iface_addr "$WAN_IF")" ]; then
@@ -1382,13 +1383,13 @@ if [ "$MODE" = ppp ]; then
 		ok "ppp0 поднят: $ADDR"
 	fi
 
-	# DNS оператора спрашиваем у самого модема, 8.8.8.8 — запасной вариант.
+	# DNS оператора спрашиваем у самого модема, CHECK_HOST — запасной вариант.
 	DNS=""
 	if [ -n "$CTRL_TTY" ] && [ -c "$CTRL_TTY" ] && ! pidof pppd >/dev/null 2>&1; then
 		DNS=$(at "$CTRL_TTY" "AT+CGCONTRDP=1" 3 |
 			sed -n 's/.*+CGCONTRDP: [^"]*"[^"]*","[^"]*","[^"]*","\([0-9.]*\)".*/\1/p' | head -1)
 	fi
-	DNS=${DNS:-8.8.8.8}
+	DNS=${DNS:-$CHECK_HOST}
 fi
 
 # Найденное выше — это «как отдал оператор»; последнее слово за настройкой.
@@ -1406,10 +1407,10 @@ else
 	ok "маршрут по умолчанию для $WAN_IF в таблице $TABLE"
 
 	if [ "$CHECK_ONLY" = 0 ]; then
-		if ping -c 2 -W 4 -I "$WAN_IF" 8.8.8.8 >/dev/null 2>&1; then
-			ok "связь есть (ping 8.8.8.8 через $WAN_IF)"
+		if ping -c 2 -W 4 -I "$WAN_IF" "$CHECK_HOST" >/dev/null 2>&1; then
+			ok "связь есть (ping $CHECK_HOST через $WAN_IF)"
 		else
-			warn "$WAN_IF поднят, но ping 8.8.8.8 не проходит"
+			warn "$WAN_IF поднят, но ping $CHECK_HOST не проходит"
 			warn "у оператора может быть заблокирован ICMP — проверь curl/nslookup"
 		fi
 	fi
@@ -1510,7 +1511,7 @@ if [ "$DO_SYSTEM" = 1 ]; then
 	fi
 fi
 if [ "$CHECK_ONLY" = 0 ] && [ -n "$ADDR" ]; then
-	if timeout 10 ping -c 1 -W 5 -I "$WAN_IF" 8.8.8.8 >/dev/null 2>&1; then
+	if timeout 10 ping -c 1 -W 5 -I "$WAN_IF" "$CHECK_HOST" >/dev/null 2>&1; then
 		say "   интернет:  есть"
 	else
 		say "   интернет:  ping не проходит (см. предупреждения выше)"

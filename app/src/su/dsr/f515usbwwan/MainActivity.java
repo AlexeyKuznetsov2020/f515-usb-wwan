@@ -346,10 +346,10 @@ public class MainActivity extends Activity {
     // Адреса для кнопок-пресетов: набирать цифры на голове неудобно, а промах по цифре
     // здесь стоит дорого — приложения останутся без резолвинга до следующей правки.
     private static final String[][] DNS_PRESETS = {
+            {"Яндекс", "77.88.8.8"},
             {"Google", "8.8.8.8"},
             {"Cloudflare", "1.1.1.1"},
             {"AdGuard", "94.140.14.14"},
-            {"Яндекс", "77.88.8.8"},
     };
 
     private void addDnsButton() {

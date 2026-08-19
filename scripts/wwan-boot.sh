@@ -72,8 +72,10 @@ BRINGUP_RETRY_DELAY=${WWAN_BRINGUP_RETRY_DELAY:-5}
 # надолго, чтобы не долбить модем и не жечь трафик впустую.
 MAX_RESTARTS_PER_HOUR=${WWAN_MAX_RESTARTS:-4}
 COOLDOWN=${WWAN_COOLDOWN:-180}
+CHECK_HOST=${WWAN_CHECK_HOST:-77.88.8.8}
 
 mkdir -p "$STATE" 2>/dev/null
+: >"$RESTARTS" 2>/dev/null
 
 log() {
 	echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null
@@ -395,7 +397,7 @@ while :; do
 		# Адрес на месте — ещё не значит, что связь живая. Но и ронять сессию
 		# из-за одного потерянного пинга нельзя: у части операторов ICMP режется,
 		# поэтому реагируем только на три неудачи подряд.
-		if timeout 15 ping -c 2 -W 5 -I "$IF" 8.8.8.8 >/dev/null 2>&1; then
+		if timeout 15 ping -c 2 -W 5 -I "$IF" "$CHECK_HOST" >/dev/null 2>&1; then
 			soft_fails=0
 			continue
 		fi
@@ -414,7 +416,12 @@ while :; do
 	CNT=$(echo "$RECENT" | grep -c '[0-9]')
 	if [ "$CNT" -ge "$MAX_RESTARTS_PER_HOUR" ]; then
 		log "watchdog: уже $CNT перезапусков за час ($REASON) — пауза $COOLDOWN с"
+		_cd_t0=$(uptime_s)
 		sleep "$COOLDOWN"
+		_cd_slept=$(( $(uptime_s) - _cd_t0 ))
+		if [ "$_cd_slept" -gt $((COOLDOWN + WAKE_SLACK)) ]; then
+			log "watchdog: голова спала во время паузы ($_cd_slept с) — сбрасываю историю"
+		fi
 		: >"$RESTARTS"
 		soft_fails=0
 		continue
