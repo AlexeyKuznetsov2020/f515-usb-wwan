@@ -1,6 +1,6 @@
 #!/bin/sh
 # scripts/install-update.sh - Тихая установка обновления APK на ГУ F515
-# Основной метод: инжектор Seres EngineeringMode (Toolbox) с немедленным закрытием
+# Основной метод: инжектор Seres EngineeringMode (Toolbox) с гарантированным автозакрытием
 # Резервный метод: pm install
 set -e
 
@@ -30,6 +30,16 @@ if [ -x "$FRIDA_INJECT" ] && [ -n "$ENGMODE_JS" ]; then
 	echo "$APK_PATH" > /data/local/tmp/engmode-install-path
 	chmod 666 /data/local/tmp/engmode-install-path
 
+	# Запускаем независимый отвязанный таймер, который гарантированно закроет EngineeringMode
+	# и вернет наше приложение на экран, даже если текущий процесс приложения будет убит во время обновления
+	(
+		sleep 2
+		am force-stop com.seres.engineeringmode >/dev/null 2>&1 || true
+		sleep 0.5
+		am start -n su.dsr.f515usbwwan/.MainActivity >/dev/null 2>&1 || true
+		rm -f "$APK_PATH" 2>/dev/null || true
+	) </dev/null >/dev/null 2>&1 &
+
 	am start -n com.seres.engineeringmode/.MainActivity >/dev/null 2>&1
 	sleep 0.5
 	PID=$(pidof com.seres.engineeringmode 2>/dev/null || true)
@@ -37,11 +47,9 @@ if [ -x "$FRIDA_INJECT" ] && [ -n "$ENGMODE_JS" ]; then
 		echo "   EngMode PID: $PID, запуск frida-inject..."
 		timeout 3 "$FRIDA_INJECT" -p "$PID" -s "$ENGMODE_JS" >/dev/null 2>&1 || true
 		sleep 0.5
-		# Немедленно закрываем окно EngineeringMode / PwdActivity и возвращаем наше приложение
 		am force-stop com.seres.engineeringmode >/dev/null 2>&1 || true
 		am start -n su.dsr.f515usbwwan/.MainActivity >/dev/null 2>&1 || true
 		echo "OK: Установка через SeresEngMode завершена"
-		rm -f "$APK_PATH"
 		exit 0
 	else
 		echo "WARN: Не удалось определить PID com.seres.engineeringmode, пробую резервный метод..."
