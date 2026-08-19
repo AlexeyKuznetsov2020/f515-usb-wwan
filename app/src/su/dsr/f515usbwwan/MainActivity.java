@@ -11,6 +11,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.View;
 import android.widget.Button;
 import android.widget.HorizontalScrollView;
@@ -33,8 +35,6 @@ public class MainActivity extends Activity {
 
     private TextView log;
     private LinearLayout buttonsRow;
-    private TextView tvVersion;
-    private Button btnUpdate;
     private UpdateManager.ReleaseInfo latestRelease;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private boolean busy = false;
@@ -42,35 +42,12 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setTitle("F515 USB WWAN v" + versionName());
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 24, 24, 24);
         root.setBackgroundColor(Color.BLACK);
-
-        // Шапка: название, текущая версия + статус версии на сервере и кнопка «Обновить»
-        LinearLayout headerRow = new LinearLayout(this);
-        headerRow.setOrientation(LinearLayout.HORIZONTAL);
-        headerRow.setGravity(Gravity.CENTER_VERTICAL);
-        headerRow.setPadding(0, 0, 0, dp(10));
-
-        tvVersion = new TextView(this);
-        tvVersion.setText("F515 USB WWAN v" + versionName() + "  [проверка обновления...]");
-        tvVersion.setTextColor(Color.LTGRAY);
-        tvVersion.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        LinearLayout.LayoutParams vLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f);
-        headerRow.addView(tvVersion, vLp);
-
-        btnUpdate = button("Обновить", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                onUpdateClicked();
-            }
-        });
-        btnUpdate.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        headerRow.addView(btnUpdate);
-
-        root.addView(headerRow);
 
         buttonsRow = new LinearLayout(this);
         buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -398,8 +375,24 @@ public class MainActivity extends Activity {
         }));
     }
 
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        MenuItem item = menu.add(0, 1001, 0, "Обновить");
+        item.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == 1001) {
+            onUpdateClicked();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
+    }
+
     private void checkServerVersionAsync() {
-        tvVersion.setText("F515 USB WWAN v" + versionName() + "  [проверка обновления...]");
+        setTitle("F515 USB WWAN v" + versionName() + " [проверка...]");
         UpdateManager.check(this, new UpdateManager.CheckCallback() {
             @Override
             public void onResult(final boolean hasUpdate, final UpdateManager.ReleaseInfo release, final String currentVersion, final String message) {
@@ -408,13 +401,9 @@ public class MainActivity extends Activity {
                     public void run() {
                         latestRelease = release;
                         if (hasUpdate) {
-                            tvVersion.setText("F515 USB WWAN v" + currentVersion + "  →  " + release.tagName + " доступна!");
-                            tvVersion.setTextColor(Color.parseColor("#4CAF50"));
-                            btnUpdate.setTextColor(Color.parseColor("#FFD700"));
+                            setTitle("F515 USB WWAN v" + currentVersion + " (доступна " + release.tagName + "!)");
                         } else {
-                            tvVersion.setText("F515 USB WWAN v" + currentVersion + "  (на сервере: " + release.tagName + " — актуально)");
-                            tvVersion.setTextColor(Color.LTGRAY);
-                            btnUpdate.setTextColor(Color.LTGRAY);
+                            setTitle("F515 USB WWAN v" + currentVersion + " (актуально)");
                         }
                     }
                 });
@@ -425,8 +414,7 @@ public class MainActivity extends Activity {
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
-                        tvVersion.setText("F515 USB WWAN v" + versionName() + "  (сервер недоступен)");
-                        tvVersion.setTextColor(Color.GRAY);
+                        setTitle("F515 USB WWAN v" + versionName());
                     }
                 });
             }
@@ -452,14 +440,10 @@ public class MainActivity extends Activity {
                         latestRelease = release;
                         append(message);
                         if (hasUpdate) {
-                            tvVersion.setText("F515 USB WWAN v" + currentVersion + "  →  " + release.tagName + " доступна!");
-                            tvVersion.setTextColor(Color.parseColor("#4CAF50"));
-                            btnUpdate.setTextColor(Color.parseColor("#FFD700"));
+                            setTitle("F515 USB WWAN v" + currentVersion + " (доступна " + release.tagName + "!)");
                             showUpdateDialog(release, currentVersion);
                         } else {
-                            tvVersion.setText("F515 USB WWAN v" + currentVersion + "  (на сервере: " + release.tagName + " — актуально)");
-                            tvVersion.setTextColor(Color.LTGRAY);
-                            btnUpdate.setTextColor(Color.LTGRAY);
+                            setTitle("F515 USB WWAN v" + currentVersion + " (актуально)");
                         }
                     }
                 });
