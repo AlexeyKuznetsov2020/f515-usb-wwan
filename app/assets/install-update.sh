@@ -1,6 +1,6 @@
 #!/bin/sh
 # scripts/install-update.sh - Тихая установка обновления APK на ГУ F515
-# Основной метод: инжектор Seres EngineeringMode (штатный механизм Toolbox)
+# Основной метод: инжектор Seres EngineeringMode (Toolbox) с немедленным закрытием
 # Резервный метод: pm install
 set -e
 
@@ -11,6 +11,7 @@ if [ ! -f "$APK_PATH" ]; then
 	exit 1
 fi
 
+chmod 666 "$APK_PATH" 2>/dev/null || true
 echo "==> Установка обновления $APK_PATH..."
 
 FRIDA_INJECT="/data/local/tmp/frida-inject"
@@ -30,13 +31,15 @@ if [ -x "$FRIDA_INJECT" ] && [ -n "$ENGMODE_JS" ]; then
 	chmod 666 /data/local/tmp/engmode-install-path
 
 	am start -n com.seres.engineeringmode/.MainActivity >/dev/null 2>&1
-	sleep 1.5
+	sleep 0.5
 	PID=$(pidof com.seres.engineeringmode 2>/dev/null || true)
 	if [ -n "$PID" ]; then
 		echo "   EngMode PID: $PID, запуск frida-inject..."
-		"$FRIDA_INJECT" -p "$PID" -s "$ENGMODE_JS" 2>&1 || true
-		sleep 2.5
+		timeout 3 "$FRIDA_INJECT" -p "$PID" -s "$ENGMODE_JS" >/dev/null 2>&1 || true
+		sleep 0.5
+		# Немедленно закрываем окно EngineeringMode / PwdActivity и возвращаем наше приложение
 		am force-stop com.seres.engineeringmode >/dev/null 2>&1 || true
+		am start -n su.dsr.f515usbwwan/.MainActivity >/dev/null 2>&1 || true
 		echo "OK: Установка через SeresEngMode завершена"
 		rm -f "$APK_PATH"
 		exit 0
