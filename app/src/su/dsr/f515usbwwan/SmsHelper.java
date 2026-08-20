@@ -2,7 +2,6 @@ package su.dsr.f515usbwwan;
 
 import android.content.Context;
 
-import java.io.ByteArrayOutputStream;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -25,10 +24,23 @@ public class SmsHelper {
 
         public SmsMessage(int index, String sender, String timestamp, String text, boolean unread) {
             this.index = index;
-            this.sender = sender != null && !sender.isEmpty() ? sender : "Неизвестный";
+            this.sender = cleanString(sender != null && !sender.isEmpty() ? sender : "Неизвестный");
             this.timestamp = timestamp != null && !timestamp.isEmpty() ? timestamp : "";
-            this.text = text != null ? text : "";
+            this.text = cleanString(text != null ? text : "");
             this.unread = unread;
+        }
+
+        private static String cleanString(String s) {
+            if (s == null) return "";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (c == '\r') continue;
+                if (c == '\n' || c == '\t' || c >= 32) {
+                    sb.append(c);
+                }
+            }
+            return sb.toString().trim();
         }
     }
 
@@ -75,20 +87,14 @@ public class SmsHelper {
         }
 
         String[] lines = output.split("\n");
-        int lastIndex = -1;
-        boolean lastUnread = false;
-
-        for (int i = 0; i < lines.length; i++) {
+        int i = 0;
+        while (i < lines.length) {
             String line = lines[i].trim();
-            if (line.isEmpty() || line.equals("OK") || line.startsWith("AT") || line.startsWith(">")) {
-                continue;
-            }
-
-            // Формат PDU: +CMGL: <index>,<stat>,[<alpha>],<length>
-            // за которым на следующей строке идёт шестнадцатеричная строка PDU
             if (line.startsWith("+CMGL:")) {
                 String header = line.substring(6).trim();
                 String[] parts = header.split(",");
+                int lastIndex = -1;
+                boolean lastUnread = false;
                 if (parts.length >= 2) {
                     try {
                         lastIndex = Integer.parseInt(parts[0].trim());
@@ -99,27 +105,32 @@ public class SmsHelper {
                     }
                 }
 
-                // Ищем строку с телом PDU или текстом
-                if (i + 1 < lines.length) {
-                    String nextLine = lines[i + 1].trim();
-                    if (!nextLine.isEmpty() && !nextLine.startsWith("+CMGL:") && !nextLine.equals("OK")) {
+                // Ищем следующую непустую строку (тело PDU или текст)
+                i++;
+                while (i < lines.length && lines[i].trim().isEmpty()) {
+                    i++;
+                }
+
+                if (i < lines.length) {
+                    String pduLine = lines[i].trim();
+                    if (!pduLine.equals("OK") && !pduLine.startsWith("+CMGL:")) {
                         SmsMessage msg = null;
-                        if (isHex(nextLine) && nextLine.length() >= 20) {
-                            msg = decodePdu(lastIndex, nextLine, lastUnread);
+                        if (isHex(pduLine) && pduLine.length() >= 20) {
+                            msg = decodePdu(lastIndex, pduLine, lastUnread);
                         }
                         if (msg == null) {
                             // Fallback для Text-mode
                             String sender = parts.length >= 3 ? parts[2].replace("\"", "").trim() : "Неизвестный";
                             String ts = parts.length >= 5 ? parts[4].replace("\"", "").trim() : "";
-                            msg = new SmsMessage(lastIndex, sender, ts, decodeIfHexUcs2(nextLine), lastUnread);
+                            msg = new SmsMessage(lastIndex, sender, ts, decodeIfHexUcs2(pduLine), lastUnread);
                         }
-                        if (msg != null && !containsIndex(result, msg.index, msg.text)) {
+                        if (msg != null && !msg.text.isEmpty() && !containsIndex(result, msg.index, msg.text)) {
                             result.add(msg);
                         }
-                        i++; // пропустить обработанную строку
                     }
                 }
             }
+            i++;
         }
 
         // Сортировка: новые сообщения сверху
