@@ -62,9 +62,24 @@ if command -v cygpath >/dev/null 2>&1; then
     cygpath -w -f "$OUT/sources.txt" > "$OUT/sources.win.txt"
     mv -f "$OUT/sources.win.txt" "$OUT/sources.txt"
 fi
-javac -source 8 -target 8 -nowarn \
-    -bootclasspath "$PLATFORM" \
-    -d "$OUT/classes" @"$OUT/sources.txt" 2>&1 | grep -v 'bootstrap class path' || true
+# Классы и dex от прошлой сборки сносим ДО компиляции. Иначе ошибка javac остаётся
+# незамеченной: классы с прошлого раза лежат на месте, проверка «хоть один .class есть»
+# проходит, d8 их дексует — и на выходе «успешный» APK со старым кодом. Ловилось это
+# только глазами в логе, дважды подряд 2026-08-21.
+rm -rf "$OUT/classes" "$OUT/dex"
+mkdir -p "$OUT/classes" "$OUT/dex"
+
+# Вывод фильтруем (лишняя ругань про bootstrap class path), но код возврата берём от
+# САМОГО javac, а не от grep: прежнее `| grep ... || true` глотало любую ошибку
+# компиляции. Поэтому пишем в файл и фильтруем уже его.
+if ! javac -source 8 -target 8 -nowarn \
+        -bootclasspath "$PLATFORM" \
+        -d "$OUT/classes" @"$OUT/sources.txt" >"$OUT/javac.log" 2>&1; then
+    grep -v "bootstrap class path" "$OUT/javac.log" >&2 || true
+    echo "javac: компиляция провалилась (см. выше)" >&2
+    exit 1
+fi
+grep -v "bootstrap class path" "$OUT/javac.log" || true
 
 if [ -z "$(find "$OUT/classes" -name '*.class' 2>/dev/null)" ]; then
     echo "javac не выдал ни одного .class — сборка провалилась" >&2

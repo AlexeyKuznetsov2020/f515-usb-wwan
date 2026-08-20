@@ -61,10 +61,16 @@ mkdir -p "$OUT/classes" "$OUT/dex" "$PROJ/prebuilt"
 : >"$OUT/.stamp"
 
 echo "== javac (source/target 1.8)"
-javac -source 1.8 -target 1.8 -nowarn -encoding UTF-8 \
-    "${BOOTCP[@]}" \
-    -d "$OUT/classes" "$PROJ/TboxWire.java" 2>&1 |
-    grep -v -e 'bootstrap class path' -e 'source value 8' -e 'target value 8' -e '^Note:' || true
+# Код возврата берём от javac, а не от grep: прежнее `| grep ... || true` глотало
+# ошибку компиляции, и дальше собирался jar со СТАРЫМ dex.
+if ! javac -source 1.8 -target 1.8 -nowarn -encoding UTF-8 \
+        "${BOOTCP[@]}" \
+        -d "$OUT/classes" "$PROJ/TboxWire.java" >"$OUT/javac.log" 2>&1; then
+    grep -v -e 'bootstrap class path' -e 'source value 8' -e 'target value 8' -e '^Note:' "$OUT/javac.log" >&2 || true
+    echo "javac: компиляция провалилась (см. выше)" >&2
+    exit 1
+fi
+grep -v -e 'bootstrap class path' -e 'source value 8' -e 'target value 8' -e '^Note:' "$OUT/javac.log" || true
 
 if [ ! -f "$OUT/classes/TboxWire.class" ]; then
     echo "javac не выдал TboxWire.class — компиляция провалилась" >&2
