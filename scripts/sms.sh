@@ -96,13 +96,12 @@ delete)
 	;;
 
 delete_all)
-	timeout --foreground 6 sh -c '
+	timeout --foreground 12 sh -c '
 		P=$1
 		exec 3<>"$P" || exit 1
 		run_cmd() {
 			printf "%s\r" "$1" >&3
 			while read -t 1 -r line <&3; do
-				echo "$line"
 				case "$line" in
 					*OK*|*ERROR*|*+CMS\ ERROR*) break ;;
 				esac
@@ -110,8 +109,16 @@ delete_all)
 		}
 		run_cmd "AT+CPMS=\"SM\",\"SM\",\"SM\""
 		run_cmd "AT+CMGD=1,4"
+		for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+			run_cmd "AT+CMGD=$i"
+		done
+
 		run_cmd "AT+CPMS=\"ME\",\"ME\",\"ME\""
 		run_cmd "AT+CMGD=1,4"
+		for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+			run_cmd "AT+CMGD=$i"
+		done
+		echo "OK"
 	' sh "$PORT"
 	;;
 

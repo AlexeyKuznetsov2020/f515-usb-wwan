@@ -133,10 +133,16 @@ public class SmsHelper {
             i++;
         }
 
-        // Сортировка: новые сообщения сверху
+        // Сортировка: самые свежие сообщения сверху (по дате/времени, затем по индексу)
         Collections.sort(result, new Comparator<SmsMessage>() {
             @Override
             public int compare(SmsMessage a, SmsMessage b) {
+                String tsA = a.timestamp != null ? a.timestamp : "";
+                String tsB = b.timestamp != null ? b.timestamp : "";
+                int cmp = tsB.compareTo(tsA);
+                if (cmp != 0) {
+                    return cmp;
+                }
                 return Integer.compare(b.index, a.index);
             }
         });
