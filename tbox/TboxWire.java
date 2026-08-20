@@ -431,21 +431,29 @@ public final class TboxWire {
     /**
      * Поколение сети -> celluarRegisterStatus.
      *
-     * Зарегистрирован — значит шлём 6, независимо от поколения. Из всех значений switch'а
-     * в SeresStatusBarSignalPolicy на железе проверено ровно одно: 6 даёт видимые палки.
-     * Остальные группы (1, 2, 4) выведены из порядка и размера групп, но глазами их никто
-     * не смотрел, и 2026-08-12 выяснилось, что как минимум одна из них не рисует ничего:
-     * у коллеги с E173s-1 модем работал (CSQ 16, +CREG: 0,1, t2 rus), а иконки не было.
-     * E173 — свисток чисто 3G, всегда отдаёт AcT=2, мы всегда слали REG_3G=3 → пусто.
-     * На нашем стенде это не могло всплыть: E3272 на beeline всегда рапортует 4G.
+     * Шлём НАСТОЯЩИЙ код поколения (1/3/6/10) — это сырой celluarRegisterStatus, который читатель
+     * (Toolbox-твик «Статус сети») сам прогоняет через свой switch (mapSystem: 1→2G, 3→3G, 6→4G,
+     * 10→5G) и рисует нужный drawable напрямую. В прошивке (разбор SeresSystemUI: таблица drawable
+     * в IconManager по слоту status_bar_phone_signal_system) есть картинки на все четыре поколения
+     * (status_bar_ic_signal_2g/3g/4g/5g), поэтому слать всегда 6 — значит показывать 4G на 2G/3G/5G.
+     * Ровно этот баг наблюдался вживую: модем в 2G, иконка «4G» (ota_02, 2026-08-21).
      *
-     * Поколение по-прежнему определяется и попадает в текст лога — теряется только
-     * попытка отразить его в иконке, которая всё равно ни разу не сработала. Перебрать
-     * значения руками, если однажды дойдут руки: `tbox-icon.sh fake 4 --reg N`.
+     * Историческая оговорка: раньше здесь всё схлопывалось в 6, потому что на СТАРОМ, нативном пути
+     * (SOME/IP → SSBSignalPolicy.c()) у коллеги с E173s-1 (чистый 3G, AcT=2 → reg=3) иконки не было,
+     * и 3G сочли «не рисующимся». Но текущий путь — direct-draw через сам твик, а не c(); там reg
+     * маппится в state и рисуется из подтверждённой таблицы drawable. Проверить любое значение на
+     * железе: `tbox-icon.sh fake 4 --reg 1|3|6|10`.
      */
     static int genToReg(String gen) {
-        if ("нет сети".equals(gen)) return REG_NONE;
-        return REG_STATUS_REGISTERED;
+        if (gen == null) return REG_STATUS_REGISTERED;   // тип не выяснили, но модем в сети -> 4G-заглушка
+        switch (gen) {
+            case "нет сети": return REG_NONE;
+            case "2G":       return REG_2G;
+            case "3G":       return REG_3G;
+            case "4G":       return REG_4G;
+            case "5G":       return REG_5G;
+            default:         return REG_STATUS_REGISTERED;
+        }
     }
 
     /** CSQ 0..31 (99 = неизвестно) -> 0..5. RSSI(dBm) = -113 + 2*CSQ. */
@@ -551,23 +559,43 @@ public final class TboxWire {
 
     static String hilinkFlavor = null;   // "huawei" | "zte" | "none"
 
+    // Сколько подряд неудачных опросов веб-морды терпим, прежде чем честно сказать «нет сети».
+    // Линк (адрес на eth1) может пережить пропажу радио/самого модема — DHCP-адрес остаётся, а
+    // веб-API уже мёртв; без этого счётчика pollHilink вечно репортил REG_STATUS_REGISTERED (4G,
+    // середина палок) и иконка застревала на «успехе» при выдернутом/зависшем модеме. Первые
+    // GRACE опросов держим «неизвестно» (не мигаем на разовой заминке), дальше — крестик.
+    static final int HILINK_GRACE = 2;   // ~2 такта опроса (MODEM_POLL_MS) ≈ 10 c
+    static int hilinkMisses = 0;
+
     static Sig pollHilink(String iface) {
         String gw = gwOverride != null ? gwOverride : gatewayFor(iface);
         if (gw == null) {
-            return new Sig(REG_STATUS_REGISTERED, STRENGTH_WHEN_UNKNOWN,
-                    "линк " + iface + ", шлюз модема не определён");
+            return hilinkMiss("линк " + iface + ", шлюз модема не определён");
         }
         if (!"zte".equals(hilinkFlavor)) {
             Sig s = pollHuawei(gw, iface);
-            if (s != null) { hilinkFlavor = "huawei"; return s; }
+            if (s != null) { hilinkFlavor = "huawei"; hilinkMisses = 0; return s; }
         }
         if (!"huawei".equals(hilinkFlavor)) {
             Sig s = pollZte(gw, iface);
-            if (s != null) { hilinkFlavor = "zte"; return s; }
+            if (s != null) { hilinkFlavor = "zte"; hilinkMisses = 0; return s; }
         }
         hilinkFlavor = null;   // на следующем круге пробуем оба заново
-        return new Sig(REG_STATUS_REGISTERED, STRENGTH_WHEN_UNKNOWN,
-                "линк " + iface + ", веб-API модема на " + gw + " не ответило");
+        return hilinkMiss("линк " + iface + ", веб-API модема на " + gw + " не ответило");
+    }
+
+    /**
+     * Модем есть (линк живой), но подтвердить сигнал по веб-API не удалось. Разовую заминку веб-
+     * морды не показываем крестиком (держим «неизвестно/середину»), но если API не отвечает
+     * HILINK_GRACE опросов подряд — репортим отсутствие сети, а не застывший «успех».
+     */
+    static Sig hilinkMiss(String why) {
+        hilinkMisses++;
+        if (hilinkMisses <= HILINK_GRACE) {
+            return new Sig(REG_STATUS_REGISTERED, STRENGTH_WHEN_UNKNOWN,
+                    why + " (попытка " + hilinkMisses + "/" + HILINK_GRACE + ")");
+        }
+        return new Sig(REG_NONE, -1, why + " (" + hilinkMisses + " опросов подряд → нет сети)");
     }
 
     /**
