@@ -82,9 +82,11 @@ BRINGUP_RETRY_DELAY=${WWAN_BRINGUP_RETRY_DELAY:-5}
 # Больше стольких перезапусков за час — считаем, что чиним не то, и уходим спать
 # надолго, чтобы не долбить модем и не жечь трафик впустую.
 MAX_RESTARTS_PER_HOUR=${WWAN_MAX_RESTARTS:-4}
-COOLDOWN=${WWAN_COOLDOWN:-1800}
+COOLDOWN=${WWAN_COOLDOWN:-180}
+CHECK_HOST=${WWAN_CHECK_HOST:-77.88.8.8}
 
 mkdir -p "$STATE" 2>/dev/null
+: >"$RESTARTS" 2>/dev/null
 
 log() {
 	echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null
@@ -134,10 +136,20 @@ wan_iface() { cat "$WAN_FILE" 2>/dev/null; }
 # чужой процесс.
 watchdog_pid() {
 	_w=$(cat "$PIDFILE" 2>/dev/null)
-	[ -n "$_w" ] || return 1
-	kill -0 "$_w" 2>/dev/null || return 1
-	grep -qs wwan-boot /proc/$_w/cmdline || return 1
-	echo "$_w"
+	if [ -n "$_w" ] && kill -0 "$_w" 2>/dev/null && grep -qs wwan-boot /proc/$_w/cmdline; then
+		echo "$_w"
+		return 0
+	fi
+	# Если pidfile потерян, ищем процесс по cmdline
+	for _p in $(ps -A -o PID,CMD 2>/dev/null | grep wwan-boot | awk '{print $1}'); do
+		[ "$_p" = "$$" ] && continue
+		if kill -0 "$_p" 2>/dev/null && grep -qs wwan-boot /proc/$_p/cmdline; then
+			echo "$_p" >"$PIDFILE" 2>/dev/null
+			echo "$_p"
+			return 0
+		fi
+	done
+	return 1
 }
 
 iface_addr() { ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1; }
@@ -313,18 +325,19 @@ fi
 
 # -------------------------------------------------------------- подъём ------
 bring_up() {
+	_extra_args="${*:-}"
 	_a=$(read_num "$ATTEMPTS")
 	echo $((_a + 1)) >"$ATTEMPTS"
 	sync
 	_try=1
 	while :; do
-		log "--- wwan-up.sh --system --boot (заход $((_a + 1)), попытка $_try/$BRINGUP_RETRIES) ---"
+		log "--- wwan-up.sh --system --boot ${_extra_args:+$_extra_args }(заход $((_a + 1)), попытка $_try/$BRINGUP_RETRIES) ---"
 		# Вывод wwan-up.sh в boot.log НЕ перенаправляем: он и так пишет каждую
 		# свою строку в wwan.log со своими отметками времени, и копия здесь
 		# означала бы вторую запись тех же двух-трёх килобайт на флеш за заход.
 		# Наружу вывод всё же идёт: запущенному руками он нужен на экране, а у
 		# отцепленного сторожа stdout уводит в /dev/null само приложение.
-		sh "$UP" --system --boot
+		sh "$UP" --system --boot $_extra_args
 		_rc=$?
 		# Управление вернулось — значит голова пережила заход, что бы там ни было
 		# с модемом. Именно это и обнуляет счётчик (см. шапку файла).
@@ -332,7 +345,7 @@ bring_up() {
 		sync
 		_if=$(wan_iface)
 		_ad=$([ -n "$_if" ] && iface_addr "$_if")
-		if [ -n "$_ad" ]; then
+		if [ -n "$_ad" ] && [ "$_rc" -eq 0 ]; then
 			date '+%F %T' >"$LAST_OK"
 			log "подъём ок: $_if $_ad (rc=$_rc)"
 			return 0
@@ -365,10 +378,11 @@ watch_sleep() {
 
 		# Голова просыпалась. Модем на резюме переподключается к шине заново и
 		# возвращается в storage-режим, то есть связь заведомо надо поднимать —
-		# ждать для этого конца минутной паузы незачем. Выходим сразу, проверки
-		# основного цикла всё увидят и сами.
+		# ждать для этого конца минутной паузы незачем. Выходим сразу, сбрасывая
+		# счётчики ошибок, проверки основного цикла всё увидят и сами.
 		if [ "$_ws_slept" -gt $((_ws_step + WAKE_SLACK)) ]; then
 			log "watchdog: голова просыпалась (пауза $_ws_step с заняла $_ws_slept с) — проверяю связь сразу"
+			: >"$RESTARTS"
 			return 0
 		fi
 
@@ -377,10 +391,9 @@ watch_sleep() {
 			log "watchdog: $_ws_out"
 		fi
 
-		# Жёсткий отказ ловим на каждом куске, а не раз в минуту: проверка стоит
-		# одного чтения из /sys, а минута простоя на ровном месте не нужна никому.
-		# Мягкий (пинг не проходит при живом адресе) по-прежнему раз в такт: он
-		# дороже и торопиться с ним некуда.
+		# Пропажу модемной сети ловим на каждом куске, а не раз в минуту: проверка
+		# стоит одного чтения из /sys, а минута простоя на ровном месте не нужна
+		# никому. Опрос самого модема (modem_probe) дороже — он раз в такт.
 		_ws_if=$(wan_iface)
 		if [ -n "$_ws_if" ] && [ -z "$(iface_addr "$_ws_if")" ]; then
 			return 0
@@ -442,6 +455,7 @@ while :; do
 		log "watchdog: pidfile занят другим экземпляром (pid $_own) — выхожу, дальше он"
 		exit 0
 	fi
+	[ -z "$_own" ] && echo $$ >"$PIDFILE" 2>/dev/null
 
 	# Иконка сотовой сети живёт отдельным процессом и к связи отношения не имеет:
 	# проверяем её тут же, но молча и не влияя ни на что (см. docs/status-icon.md).
@@ -452,7 +466,7 @@ while :; do
 	IF=$(wan_iface)
 	if [ -z "$IF" ]; then
 		log "watchdog: интерфейс неизвестен (подъём ни разу не удался) — пробую поднять"
-		bring_up
+		bring_up --reconnect
 		continue
 	fi
 
@@ -516,9 +530,11 @@ while :; do
 	fi
 
 	# Ограничитель частоты: считаем отметки перезапусков за последний час.
+	# Валидируем таймстемпы ($1 <= now), чтобы скачки часов назад при выходе из сна
+	# не консервировали старые записи из «будущего».
 	NOW=$(date +%s)
 	touch "$RESTARTS" 2>/dev/null
-	RECENT=$(awk -v now="$NOW" 'now - $1 < 3600' "$RESTARTS" 2>/dev/null)
+	RECENT=$(awk -v now="$NOW" '$1 <= now && now - $1 < 3600' "$RESTARTS" 2>/dev/null)
 	CNT=$(echo "$RECENT" | grep -c '[0-9]')
 	if [ "$CNT" -ge "$MAX_RESTARTS_PER_HOUR" ]; then
 		log "watchdog: уже $CNT перезапусков за час ($REASON) — пауза $COOLDOWN с"
@@ -533,7 +549,7 @@ while :; do
 	mv "$RESTARTS.new" "$RESTARTS" 2>/dev/null
 
 	log "watchdog: модемная сеть пропала ($REASON) — поднимаю заново"
-	bring_up
+	bring_up --reconnect
 done
 
 rm -f "$PIDFILE"

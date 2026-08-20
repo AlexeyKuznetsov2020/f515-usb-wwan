@@ -11,6 +11,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.View;
 import android.widget.Button;
 import android.widget.HorizontalScrollView;
@@ -33,31 +35,29 @@ public class MainActivity extends Activity {
 
     private TextView log;
     private LinearLayout buttonsRow;
+    private UpdateManager.ReleaseInfo latestRelease;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private boolean busy = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setTitle("F515 USB WWAN v" + versionName());
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 24, 24, 24);
         root.setBackgroundColor(Color.BLACK);
 
-        TextView version = new TextView(this);
-        version.setText("F515 USB WWAN " + versionName());
-        version.setTextColor(Color.GRAY);
-        version.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        root.addView(version);
-
         buttonsRow = new LinearLayout(this);
         buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
         addRunButton("Проверка", "--check");
-        addRunButton("Включить", "--system");
+        addEnableButton();
         addRunButton("Выключить", "--down");
         addAutostartButton();
+        addSmsButton();
         addIconButton();
+        addDnsButton();
         addUrlButton("Интернетометр", SPEEDTEST_URL);
         addFormatButton();
         HorizontalScrollView buttonsScroll = new HorizontalScrollView(this);
@@ -83,12 +83,33 @@ public class MainActivity extends Activity {
         append("Выключить     - остановить pppd");
         append("Автозапуск    - подъём после перезагрузки головы + слежение за связью");
         append("Интернетометр - открыть " + SPEEDTEST_URL + " (проверка интернета глазами)");
-        append("Форматировать SD - выбрать и стереть SD/TF-карту (необратимо)");
-        append("");
         append("автозапуск сейчас: " + (Autostart.isEnabled(this) ? "ВКЛЮЧЕН" : "выключен"));
+
+        checkServerVersionAsync();
     }
 
     // ------------------------------------------------------------------ кнопки --
+
+    private void addEnableButton() {
+        buttonsRow.addView(button("Включить", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                runInBackground("> Включить ...", new Job() {
+                    @Override
+                    public void run(Keeper.Progress p) {
+                        Keeper.run(MainActivity.this, "--system", p);
+                        if (Autostart.isEnabled(MainActivity.this)) {
+                            String st = Keeper.runBoot(MainActivity.this, "--status", null);
+                            if (!st.contains("watchdog=1")) {
+                                p.onLine("\n> автозапуск включен — запускаю сторожа (wwan-boot.sh)...");
+                                Keeper.startAutostart(MainActivity.this, true, p);
+                            }
+                        }
+                    }
+                });
+            }
+        }));
+    }
 
     private void addRunButton(String text, final String args) {
         buttonsRow.addView(button(text, new View.OnClickListener() {
@@ -214,6 +235,111 @@ public class MainActivity extends Activity {
         b.show();
     }
 
+    private void addSmsButton() {
+        buttonsRow.addView(button("СМС", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                loadSmsAndShow();
+            }
+        }));
+    }
+
+    private void loadSmsAndShow() {
+        if (busy) return;
+        setBusy(true);
+        append("");
+        append("> Чтение SMS из памяти модема...");
+        background(new Runnable() {
+            @Override
+            public void run() {
+                final List<SmsHelper.SmsMessage> list = SmsHelper.readAll(MainActivity.this, new Keeper.Progress() {
+                    @Override
+                    public void onLine(String line) {
+                        // Не спамим сырым выводом в общий лог экрана
+                    }
+                });
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        append("> Найдено SMS: " + list.size());
+                        showSmsDialog(list);
+                    }
+                });
+            }
+        });
+    }
+
+    private void showSmsDialog(final List<SmsHelper.SmsMessage> messages) {
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle("Входящие SMS (" + messages.size() + ")");
+
+        if (messages.isEmpty()) {
+            b.setMessage("Сообщений нет (память SIM/модема пуста) или модем не ответил.");
+        } else {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < messages.size(); i++) {
+                SmsHelper.SmsMessage m = messages.get(i);
+                sb.append("От: ").append(m.sender);
+                if (!m.timestamp.isEmpty()) {
+                    sb.append(" | ").append(m.timestamp);
+                }
+                sb.append("\n");
+                sb.append(m.text).append("\n");
+                if (i < messages.size() - 1) {
+                    sb.append("----------------------------------------\n\n");
+                }
+            }
+            b.setMessage(sb.toString());
+        }
+
+        b.setNegativeButton("Закрыть", null);
+        b.setNeutralButton("Обновить", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                loadSmsAndShow();
+            }
+        });
+
+        if (!messages.isEmpty()) {
+            b.setPositiveButton("Удалить все", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface dialog, int which) {
+                    confirmDeleteAllSms();
+                }
+            });
+        }
+
+        AlertDialog d = b.create();
+        d.show();
+
+        TextView messageView = (TextView) d.findViewById(android.R.id.message);
+        if (messageView != null) {
+            messageView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+            messageView.setTextIsSelectable(true);
+        }
+    }
+
+    private void confirmDeleteAllSms() {
+        new AlertDialog.Builder(this)
+                .setTitle("Удалить все SMS?")
+                .setMessage("Все сообщения будут безвозвратно удалены из памяти SIM-карты и модема.")
+                .setPositiveButton("Удалить", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        runInBackground("> Удаляю все SMS...", new Job() {
+                            @Override
+                            public void run(Keeper.Progress p) {
+                                SmsHelper.deleteAll(MainActivity.this, p);
+                                p.onLine("\n> Все SMS удалены");
+                            }
+                        });
+                    }
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
     /**
      * Иконка сотовой сети в статус-баре. Как и автозапуск, это не разовое действие, а
      * состояние, которое живёт само по себе, поэтому сначала спрашиваем голову, что там
@@ -319,6 +445,265 @@ public class MainActivity extends Activity {
             }
         });
         b.show();
+    }
+
+    // Адреса для кнопок-пресетов: набирать цифры на голове неудобно, а промах по цифре
+    // здесь стоит дорого — приложения останутся без резолвинга до следующей правки.
+    private static final String[][] DNS_PRESETS = {
+            {"Яндекс", "77.88.8.8"},
+            {"Google", "8.8.8.8"},
+            {"Cloudflare", "1.1.1.1"},
+            {"AdGuard", "94.140.14.14"},
+    };
+
+    private void addDnsButton() {
+        buttonsRow.addView(button("DNS", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (busy) return;
+                setBusy(true);
+                append("");
+                append("> DNS: читаю настройку...");
+                background(new Runnable() {
+                    @Override
+                    public void run() {
+                        final String out = Keeper.run(MainActivity.this, "--dns", null);
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                setBusy(false);
+                                showDnsDialog(out);
+                            }
+                        });
+                    }
+                });
+            }
+        }));
+    }
+
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        MenuItem item = menu.add(0, 1001, 0, "Обновить");
+        item.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == 1001) {
+            onUpdateClicked();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
+    }
+
+    private void checkServerVersionAsync() {
+        setTitle("F515 USB WWAN v" + versionName() + " [проверка...]");
+        UpdateManager.check(this, new UpdateManager.CheckCallback() {
+            @Override
+            public void onResult(final boolean hasUpdate, final UpdateManager.ReleaseInfo release, final String currentVersion, final String message) {
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        latestRelease = release;
+                        if (hasUpdate) {
+                            setTitle("F515 USB WWAN v" + currentVersion + " (доступна " + release.tagName + "!)");
+                        } else {
+                            setTitle("F515 USB WWAN v" + currentVersion + " (актуально)");
+                        }
+                    }
+                });
+            }
+
+            @Override
+            public void onError(final String error) {
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setTitle("F515 USB WWAN v" + versionName());
+                    }
+                });
+            }
+        });
+    }
+
+    private void onUpdateClicked() {
+        if (busy) return;
+        if (latestRelease != null && UpdateManager.isVersionNewer(latestRelease.versionName, versionName())) {
+            showUpdateDialog(latestRelease, versionName());
+            return;
+        }
+        setBusy(true);
+        append("");
+        append("> Проверка обновлений на GitHub...");
+        UpdateManager.check(this, new UpdateManager.CheckCallback() {
+            @Override
+            public void onResult(final boolean hasUpdate, final UpdateManager.ReleaseInfo release, final String currentVersion, final String message) {
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        latestRelease = release;
+                        append(message);
+                        if (hasUpdate) {
+                            setTitle("F515 USB WWAN v" + currentVersion + " (доступна " + release.tagName + "!)");
+                            showUpdateDialog(release, currentVersion);
+                        } else {
+                            setTitle("F515 USB WWAN v" + currentVersion + " (актуально)");
+                        }
+                    }
+                });
+            }
+
+            @Override
+            public void onError(final String error) {
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        append("ERROR: " + error);
+                    }
+                });
+            }
+        });
+    }
+
+    private void showUpdateDialog(final UpdateManager.ReleaseInfo release, String currentVer) {
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle("Доступно обновление: " + release.tagName);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Текущая версия: v").append(currentVer).append("\n");
+        sb.append("Новая версия: ").append(release.tagName).append("\n\n");
+        if (release.body != null && !release.body.trim().isEmpty()) {
+            sb.append("Что нового:\n").append(release.body.trim()).append("\n\n");
+        }
+        sb.append("После скачивания приложение закроется.\n");
+        sb.append("Дождитесь сообщения «Успешная установка» и после этого откройте приложение.\n\n");
+        sb.append("Установить обновление сейчас?");
+        b.setMessage(sb.toString());
+
+        b.setPositiveButton("Установить", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                setBusy(true);
+                append("");
+                append("> Запуск процесса обновления...");
+                UpdateManager.downloadAndInstall(MainActivity.this, release, new Keeper.Progress() {
+                    @Override
+                    public void onLine(final String line) {
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                append(line);
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        b.setNegativeButton("Позже", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                dialog.dismiss();
+            }
+        });
+        b.show();
+    }
+
+    /**
+     * Куда уходят DNS-запросы приложений. Меняется ровно одна вещь — цель DNAT'а на DNS
+     * фантомной TBOX-сети; почему другого места на этой прошивке нет, написано в
+     * wwan-up.sh (функция dns_nat) и docs/app-network.md.
+     */
+    private void showDnsDialog(String status) {
+        String setting = value(status, "dns");
+        String active = value(status, "dns_active");
+        String auto = value(status, "dns_auto");
+        if (setting.isEmpty()) setting = "auto";
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), 0);
+
+        TextView msg = new TextView(this);
+        StringBuilder t = new StringBuilder();
+        t.append("Куда уходят DNS-запросы приложений, пока интернет идёт через модем. ")
+                .append("На Wi-Fi приложения берут DNS роутера — эта настройка их не касается.\n\n");
+        t.append("Сейчас: ").append(active.isEmpty() ? "штатный DNS сети" : active);
+        if (setting.equals("auto")) {
+            t.append("\nНастройка: авто");
+            if (!auto.isEmpty()) t.append(" (оператор даёт ").append(auto).append(')');
+        } else {
+            t.append("\nНастройка: ").append(setting).append(" (задан вручную)");
+        }
+        t.append("\n\nПустое поле = вернуться к DNS оператора.");
+        msg.setText(t.toString());
+        box.addView(msg);
+
+        final android.widget.EditText input = new android.widget.EditText(this);
+        // Именно текстовое поле, а не NUMBER: на цифровой клавиатуре головы точки может
+        // не оказаться вовсе, а адрес без точек не введёшь.
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
+        input.setSingleLine(true);
+        input.setHint("например 1.1.1.1");
+        if (!setting.equals("auto")) input.setText(setting);
+        box.addView(input);
+
+        LinearLayout presets = new LinearLayout(this);
+        presets.setOrientation(LinearLayout.HORIZONTAL);
+        for (String[] p : DNS_PRESETS) {
+            final String addr = p[1];
+            Button b = button(p[0], new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    input.setText(addr);
+                    input.setSelection(addr.length());
+                }
+            });
+            presets.addView(b);
+        }
+        HorizontalScrollView presetsScroll = new HorizontalScrollView(this);
+        presetsScroll.addView(presets);
+        box.addView(presetsScroll);
+
+        new AlertDialog.Builder(this)
+                .setTitle("DNS для приложений")
+                .setView(box)
+                .setPositiveButton("Применить", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        String v = input.getText().toString().trim();
+                        applyDns(v.isEmpty() ? "auto" : v);
+                    }
+                })
+                .setNeutralButton("DNS оператора", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        applyDns("auto");
+                    }
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
+    /**
+     * Похож ли адрес на адрес — решает скрипт (одна проверка на всех, в том числе для
+     * правки wwan.conf руками), его отказ виден в логе на экране. Здесь только защита
+     * командной строки: строка уходит в `sh wwan-up.sh --dns=<...>` через adb-шелл, и
+     * точка с запятой в поле ввода стала бы отдельной командой с правами root.
+     */
+    private void applyDns(final String value) {
+        if (!value.matches("auto|[0-9.]{1,15}")) {
+            append("> DNS: '" + value + "' — в адресе только цифры и точки");
+            return;
+        }
+        runInBackground("> DNS: " + value + "...", new Job() {
+            @Override
+            public void run(Keeper.Progress p) {
+                Keeper.run(MainActivity.this, "--dns=" + value, p);
+            }
+        });
     }
 
     private void stopWatchdog() {

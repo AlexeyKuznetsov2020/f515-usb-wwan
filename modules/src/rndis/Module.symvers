@@ -1,0 +1,6 @@
+0x67af453d	generic_rndis_bind	/home/dsultanr/f515/repo-f515-usb-wwan/modules/src/rndis/f515_rndis	EXPORT_SYMBOL_GPL	
+0xb75b7691	rndis_status	/home/dsultanr/f515/repo-f515-usb-wwan/modules/src/rndis/f515_rndis	EXPORT_SYMBOL_GPL	
+0x14a59532	rndis_rx_fixup	/home/dsultanr/f515/repo-f515-usb-wwan/modules/src/rndis/f515_rndis	EXPORT_SYMBOL_GPL	
+0xf88d76af	rndis_tx_fixup	/home/dsultanr/f515/repo-f515-usb-wwan/modules/src/rndis/f515_rndis	EXPORT_SYMBOL_GPL	
+0x12d17da0	rndis_command	/home/dsultanr/f515/repo-f515-usb-wwan/modules/src/rndis/f515_rndis	EXPORT_SYMBOL_GPL	
+0x4ec2f0e7	rndis_unbind	/home/dsultanr/f515/repo-f515-usb-wwan/modules/src/rndis/f515_rndis	EXPORT_SYMBOL_GPL	

@@ -15,6 +15,7 @@
 | `cdc-wdm.ko` | служебный WDM-канал NCM-функции | NCM |
 | `cdc_ncm.ko` | собственно NCM поверх встроенного `usbnet` | NCM |
 | `huawei_cdc_ncm.ko` | NCM Huawei, спрятанный за vendor-классом `ff/02/16` | NCM |
+| `f515_rndis.ko` | автономный RNDIS поверх `usbnet` (MTS 81332FT, ZTE MF90) | RNDIS / HiLink |
 
 NCM-тройке повезло: каркас `usbnet` в ядре головы **встроен** (`CONFIG_USB_USBNET=y`,
 `CONFIG_MII=y`, 41 экспортируемый символ `usbnet_*`), поэтому драйверы собираются как
@@ -85,5 +86,8 @@ python3 extract-symvers.py oem.symvers /vendor/lib/modules/*.ko   # только
   `huawei_cdc_ncm_devs` уже содержит нужную четвёрку `(12d1, ff, 02, 16)`. В отличие от
   usbserial в один `.ko` не сливаются — межмодульные символы modpost разрешает сам,
   раз все три собираются одним проходом.
+- `src/rndis/` — автономный `f515_rndis.c` с встроенным CDC-биндингом (не зависящим от
+  монолитного `cdc_ether`, в котором отключен RNDIS) для поддержки RNDIS-роутеров
+  (MTS 81332FT, ZTE MF90 и др.).
 - `prebuilt/*.ko` — готовые модули для `5.4.86-qgki-g310fb9b27fcd-dirty`.
 - `build-cfi.sh`, `extract-symvers.py`, `oem.symvers` — инструменты пересборки.

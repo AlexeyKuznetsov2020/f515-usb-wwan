@@ -17,7 +17,7 @@ set -e
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=${KDIR:?"укажи KDIR=/путь/к/исходникам/ядра"}
-MOD=${1:?"использование: build-cfi.sh <каталог-внешнего-модуля>"}
+MOD=$(cd "${1:?"использование: build-cfi.sh <каталог-внешнего-модуля>"}" && pwd)
 RUNNING_CONFIG=${RUNNING_CONFIG:-$HERE/running.config}
 TOOLCHAIN_BIN=${TOOLCHAIN_BIN:-$HERE/llvm-bin}
 SYMVERS=${SYMVERS:-$HERE/oem.symvers}
@@ -25,9 +25,15 @@ SYMVERS=${SYMVERS:-$HERE/oem.symvers}
 # При CONFIG_LTO_CLANG корневой Makefile жёстко прописывает NM/LLVM_NM = llvm-nm
 # (без суффикса версии) — если такого бинаря в PATH нет (Debian ставит clang-11 как
 # llvm-nm-11), нужен каталог симлинков без суффикса.
-if [ -d "$TOOLCHAIN_BIN" ]; then
-	export PATH="$TOOLCHAIN_BIN:$PATH"
+if [ ! -d "$TOOLCHAIN_BIN" ]; then
+	mkdir -p "$TOOLCHAIN_BIN"
+	for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+		if [ -x "/usr/bin/${tool}-11" ]; then
+			ln -sf "/usr/bin/${tool}-11" "$TOOLCHAIN_BIN/${tool}"
+		fi
+	done
 fi
+export PATH="$TOOLCHAIN_BIN:$PATH"
 
 TOOLS=(
 	CC=clang

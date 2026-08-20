@@ -1,0 +1,6 @@
+__crc_rndis_status = 0xb75b7691;
+__crc_rndis_command = 0x12d17da0;
+__crc_generic_rndis_bind = 0x67af453d;
+__crc_rndis_unbind = 0x4ec2f0e7;
+__crc_rndis_rx_fixup = 0x14a59532;
+__crc_rndis_tx_fixup = 0xf88d76af;

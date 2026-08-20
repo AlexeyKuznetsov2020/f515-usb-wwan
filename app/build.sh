@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SDK=${ANDROID_SDK:-/home/dsultanr/android-sdk}
-BT=${ANDROID_BUILD_TOOLS:-$SDK/android-14}
+BT=${BUILD_TOOLS:-$SDK/android-14}
 PLATFORM=${ANDROID_JAR:-$SDK/android-11/android.jar}
 PROJ=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$PROJ/.." && pwd)
@@ -20,11 +20,14 @@ mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/res-compiled" "$PROJ/assets"
 echo "== assets (scripts + modules + tools)"
 for f in "$ROOT"/scripts/wwan-up.sh "$ROOT"/scripts/wwan-boot.sh \
          "$ROOT"/scripts/dial.sh "$ROOT"/scripts/at.sh "$ROOT"/scripts/format-sdcard.sh \
-         "$ROOT"/scripts/tbox-icon.sh "$ROOT"/tbox/prebuilt/tboxwire.jar \
+         "$ROOT"/scripts/tbox-icon.sh "$ROOT"/scripts/install-update.sh \
+         "$ROOT"/scripts/sms.sh \
+         "$ROOT"/tbox/prebuilt/tboxwire.jar \
          "$ROOT"/tools/huawei-modeswitch \
          "$ROOT"/modules/prebuilt/usbserialmerged2.ko "$ROOT"/modules/prebuilt/ppp_async.ko \
          "$ROOT"/modules/prebuilt/cdc-wdm.ko "$ROOT"/modules/prebuilt/cdc_ncm.ko \
-         "$ROOT"/modules/prebuilt/huawei_cdc_ncm.ko; do
+         "$ROOT"/modules/prebuilt/huawei_cdc_ncm.ko \
+         "$ROOT"/modules/prebuilt/f515_rndis.ko; do
     case "$f" in
     # Чекаут под Windows (core.autocrlf=true) отдаёт скрипты с CRLF, а
     # /system/bin/sh на голове давится на \r - нормализуем при копировании.
