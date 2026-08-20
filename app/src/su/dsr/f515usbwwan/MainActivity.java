@@ -55,6 +55,7 @@ public class MainActivity extends Activity {
         addEnableButton();
         addRunButton("Выключить", "--down");
         addAutostartButton();
+        addSmsButton();
         addIconButton();
         addDnsButton();
         addUrlButton("Интернетометр", SPEEDTEST_URL);
@@ -232,6 +233,111 @@ public class MainActivity extends Activity {
             });
         }
         b.show();
+    }
+
+    private void addSmsButton() {
+        buttonsRow.addView(button("СМС", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                loadSmsAndShow();
+            }
+        }));
+    }
+
+    private void loadSmsAndShow() {
+        if (busy) return;
+        setBusy(true);
+        append("");
+        append("> Чтение SMS из памяти модема...");
+        background(new Runnable() {
+            @Override
+            public void run() {
+                final List<SmsHelper.SmsMessage> list = SmsHelper.readAll(MainActivity.this, new Keeper.Progress() {
+                    @Override
+                    public void onLine(String line) {
+                        // Не спамим сырым выводом в общий лог экрана
+                    }
+                });
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        append("> Найдено SMS: " + list.size());
+                        showSmsDialog(list);
+                    }
+                });
+            }
+        });
+    }
+
+    private void showSmsDialog(final List<SmsHelper.SmsMessage> messages) {
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle("Входящие SMS (" + messages.size() + ")");
+
+        if (messages.isEmpty()) {
+            b.setMessage("Сообщений нет (память SIM/модема пуста) или модем не ответил.");
+        } else {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < messages.size(); i++) {
+                SmsHelper.SmsMessage m = messages.get(i);
+                sb.append("От: ").append(m.sender);
+                if (!m.timestamp.isEmpty()) {
+                    sb.append(" | ").append(m.timestamp);
+                }
+                sb.append("\n");
+                sb.append(m.text).append("\n");
+                if (i < messages.size() - 1) {
+                    sb.append("----------------------------------------\n\n");
+                }
+            }
+            b.setMessage(sb.toString());
+        }
+
+        b.setNegativeButton("Закрыть", null);
+        b.setNeutralButton("Обновить", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                loadSmsAndShow();
+            }
+        });
+
+        if (!messages.isEmpty()) {
+            b.setPositiveButton("Удалить все", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface dialog, int which) {
+                    confirmDeleteAllSms();
+                }
+            });
+        }
+
+        AlertDialog d = b.create();
+        d.show();
+
+        TextView messageView = (TextView) d.findViewById(android.R.id.message);
+        if (messageView != null) {
+            messageView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+            messageView.setTextIsSelectable(true);
+        }
+    }
+
+    private void confirmDeleteAllSms() {
+        new AlertDialog.Builder(this)
+                .setTitle("Удалить все SMS?")
+                .setMessage("Все сообщения будут безвозвратно удалены из памяти SIM-карты и модема.")
+                .setPositiveButton("Удалить", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        runInBackground("> Удаляю все SMS...", new Job() {
+                            @Override
+                            public void run(Keeper.Progress p) {
+                                SmsHelper.deleteAll(MainActivity.this, p);
+                                p.onLine("\n> Все SMS удалены");
+                            }
+                        });
+                    }
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
     }
 
     /**
