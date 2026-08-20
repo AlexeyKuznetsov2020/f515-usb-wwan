@@ -33,37 +33,17 @@
  * Запуск: scripts/tbox-icon.sh. Разовый опрос модема без всякого SOME/IP: --signal.
  */
 
-import java.io.OutputStream;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
 import java.net.HttpURLConnection;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.NetworkInterface;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.net.URL;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
 import java.util.Date;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 
 public final class TboxWire {
 
     // ------------------------------------------------------------------ константы провода
     // Всё сверено с /vendor/etc/ksomeip-service.json (сервис №6) и java-манифестом
     // ics/ini_cellularnetwork/ini_cellularnetwork_manifest.java.
-    static final int SERVICE_ID = 0x8002;
-    static final int INSTANCE_ID = 0x0001;
-    static final int MAJOR_VERSION = 0x01;
-    static final int MINOR_VERSION = 0x00000001;
-    static final int EVENT_ID = 0x8001;      // reportCellularNetworkInfo
-    static final int EVENTGROUP = 0x0002;    // eventgroup, в которой лежит 0x8001
 
-    static final String MCAST_ADDR = "239.0.0.255";
-    static final int SD_PORT = 30490;
 
     // Значения полей CellularNetworkInfo (см. раздел 3 ~/f515/TBOX_SOMEIP_EMULATION.md).
     //
@@ -86,9 +66,6 @@ public final class TboxWire {
     // Эти три поля голова принимает, но на иконку они не влияют вообще: SystemUI подписан
     // только на ID_CELLULAR_SIGNAL_SYSTEM, _STRENGTH и _ON_OFF_CARD. Оставлены осмысленными
     // на случай, если их читает кто-то ещё.
-    static final int ESIM_STATUS_OK = 1;
-    static final int SERVICE_STATUS_CONNECTED = 1;
-    static final int ROAMING_NONE = 0;
 
     // ------------------------------------------------------------------ источник сигнала
     // Состояние WAN пишет wwan-up.sh: state/wan-iface — имя поднятого интерфейса.
@@ -112,11 +89,6 @@ public final class TboxWire {
             "\\+CREG:\\s*\\d+\\s*,\\s*(\\d+)", java.util.regex.Pattern.CASE_INSENSITIVE);
 
     // ------------------------------------------------------------------ параметры запуска
-    static String srcIp = "192.168.62.37";
-    static String peerIp = "192.168.62.4";
-    static String ifaceName = "vlan62";
-    static int tcpPort = 30542;
-    static int offerMs = 1000;   // cyclic_offer_delay из SdConfig
     static int notifyMs = 5000;
     // Фазы уведомлений. IDLE — обычный режим, шлём то, что намерил модем; остальные две
     // рисуют анимацию вместо заглушки, каждая со своим тактом. Опрос модема от этого чаще
@@ -134,9 +106,7 @@ public final class TboxWire {
     static int phaseTickMs(int phase) {
         return phase == PHASE_APPCHECK ? APPCHECK_NOTIFY_MS : CONNECTING_NOTIFY_MS;
     }
-    static int ttl = 3;          // TTL из SdConfig; в SD это секунды жизни оффера
     static int fixedStrength = Integer.MIN_VALUE;  // MIN_VALUE == брать реальный сигнал модема
-    static boolean probeOnly = false;  // только offer + дамп входящего, без TCP и событий
     static boolean signalOnly = false; // разовый опрос модема и выход, без SOME/IP
     static String gwOverride = null;   // адрес веб-API hilink-модема, если не угадывается
     static int regOverride = -1;       // сырой celluarRegisterStatus — посмотреть, что нарисуется
@@ -151,7 +121,6 @@ public final class TboxWire {
     static String signalFile = null;
 
     static volatile int session = 1;
-    static final List<Socket> clients = new ArrayList<Socket>();
 
     static final SimpleDateFormat TS = new SimpleDateFormat("HH:mm:ss.SSS");
 
@@ -172,35 +141,19 @@ public final class TboxWire {
     // редкий маячок, чтобы по логу было видно, что мы живы. Всё необычное (чужой
     // сервис, отвалившийся клиент, медленная запись) пишется как писалось: молчание
     // должно означать «всё ровно», а не «мы перестали смотреть».
-    static final int SUB_SUMMARY_MS = 60000;
     static final int NOTIFY_HEARTBEAT_MS = 600000;
 
-    static final Set<Integer> subSeen = new HashSet<Integer>();
-    static int subRenewals = 0;
-    static long lastSubSummaryNs = System.nanoTime();
     static int lastLoggedReg = Integer.MIN_VALUE;
     static int lastLoggedStrength = Integer.MIN_VALUE;
     static long lastNotifyLogNs = 0;
-    static long lastIdleLogNs = 0;
 
-    /** Пишет сводку по обновлениям подписки не чаще раза в минуту. */
-    static void subSummary() {
-        long now = System.nanoTime();
-        if (now - lastSubSummaryNs < SUB_SUMMARY_MS * 1000000L) return;
-        if (subRenewals > 0) {
-            say("подписка обновлена " + subRenewals + " раз за "
-                    + ((now - lastSubSummaryNs) / 1000000000L) + " с");
-        }
-        subRenewals = 0;
-        lastSubSummaryNs = now;
-    }
 
-    /** Стоит ли писать строку про очередное отправленное событие. */
-    static boolean notifyWorthLogging(Sig sig, long tookMs) {
+    /** Стоит ли писать строку про очередной сигнал: только смена или редкий маячок. */
+    static boolean notifyWorthLogging(Sig sig) {
         long now = System.nanoTime();
         boolean changed = sig.reg != lastLoggedReg || sig.strength != lastLoggedStrength;
         boolean heartbeat = now - lastNotifyLogNs >= NOTIFY_HEARTBEAT_MS * 1000000L;
-        if (!changed && !heartbeat && tookMs < SLOW_WRITE_WARN_MS) return false;
+        if (!changed && !heartbeat) return false;
         lastLoggedReg = sig.reg;
         lastLoggedStrength = sig.strength;
         lastNotifyLogNs = now;
@@ -214,225 +167,27 @@ public final class TboxWire {
 
         if (signalOnly) { dumpSignal(); return; }
 
-        say("==================== TboxWire ====================");
-        say("src " + srcIp + " (" + ifaceName + ")  peer " + peerIp);
-        say("service 0x" + Integer.toHexString(SERVICE_ID) + " instance " + INSTANCE_ID
-                + " major " + MAJOR_VERSION + " -> tcp endpoint " + srcIp + ":" + tcpPort);
-        say("event 0x" + Integer.toHexString(EVENT_ID) + " eventgroup 0x"
-                + Integer.toHexString(EVENTGROUP) + ", сигнал: "
-                + (fixedStrength != Integer.MIN_VALUE
-                        ? ("фиксированный strength=" + fixedStrength)
-                        : "реальный модем"));
-        say("offer каждые " + offerMs + " мс, notification каждые " + notifyMs + " мс"
-                + (probeOnly ? "  [PROBE: только offer и дамп]" : ""));
-        say("=================================================");
+        say("=================== сигнал в файл ===================");
+        say("источник: " + (fixedStrength != Integer.MIN_VALUE
+                ? ("фиксированный strength=" + fixedStrength) : "реальный модем"));
+        say("файл:     " + signalFile + ", такт " + notifyMs + " мс");
+        say("====================================================");
 
-        final InetAddress src = InetAddress.getByName(srcIp);
-        final InetAddress mcast = InetAddress.getByName(MCAST_ADDR);
-        final InetAddress peer = InetAddress.getByName(peerIp);
-
-        // Сокет для SD. Привязан к srcIp:30490 — так и исходящие уйдут с нужного адреса,
-        // и юникастовый ответ (SubscribeEventgroup) прилетит именно сюда. Мультикаст на
-        // такой сокет не приходит, но он нам и не нужен: подписка идёт юникастом.
-        final DatagramSocket sd = new DatagramSocket(null);
-        sd.setReuseAddress(true);
-        sd.bind(new InetSocketAddress(src, SD_PORT));
-        say("SD-сокет поднят на " + sd.getLocalSocketAddress());
-
-        NetworkInterface nif = NetworkInterface.getByName(ifaceName);
-        if (nif == null) say("ВНИМАНИЕ: интерфейс " + ifaceName + " не найден, мультикаст пойдёт по умолчанию");
-
-        // --- поток передачи offer'ов
-        Thread offerThread = new Thread(new Runnable() {
-            public void run() {
-                while (true) {
-                    try {
-                        byte[] msg = buildOffer(srcIp, tcpPort, ttl);
-                        sd.send(new DatagramPacket(msg, msg.length, mcast, SD_PORT));
-                        sd.send(new DatagramPacket(msg, msg.length, peer, SD_PORT));
-                        Thread.sleep(offerMs);
-                    } catch (Exception e) {
-                        say("offer: " + e);
-                        try { Thread.sleep(1000); } catch (InterruptedException ie) { return; }
-                    }
-                }
-            }
-        }, "offer");
-        offerThread.setDaemon(true);
-        offerThread.start();
-
-        if (!probeOnly) {
-            startTcpServer(src, tcpPort);
-            // Опрос модема — раньше нотификатора: к первому такту уже есть что отправить.
-            startPoller();
-            startNotifier();
+        if (signalFile == null) {
+            say("--signal-file не задан: писать некуда, выхожу");
+            return;
         }
 
-        // --- приём SD
-        byte[] buf = new byte[2048];
-        while (true) {
-            DatagramPacket p = new DatagramPacket(buf, buf.length);
-            sd.receive(p);
-            String from = p.getAddress().getHostAddress();
-            if (from.equals(srcIp)) continue;          // собственный мультикаст, вернувшийся петлёй
-            handleSd(sd, p, from);
-        }
+        // Опрос модема — раньше нотификатора: к первому такту уже есть что писать.
+        startPoller();
+        runNotifier();
     }
 
-    // ------------------------------------------------------------------ разбор входящего SD
 
-    static void handleSd(DatagramSocket sd, DatagramPacket p, String from) {
-        byte[] d = p.getData();
-        int len = p.getLength();
-        if (len < 28) { say("SD от " + from + ": короткий пакет " + len + " Б"); return; }
-        int entriesLen = readInt(d, 20);
-        int off = 24;
-        int end = Math.min(24 + entriesLen, len);
-        while (off + 16 <= end) {
-            int type = d[off] & 0xff;
-            int svc = readShort(d, off + 4);
-            int inst = readShort(d, off + 6);
-            int maj = d[off + 8] & 0xff;
-            int entryTtl = ((d[off + 9] & 0xff) << 16) | ((d[off + 10] & 0xff) << 8) | (d[off + 11] & 0xff);
-            String name = type == 0x00 ? "FindService"
-                    : type == 0x01 ? "OfferService"
-                    : type == 0x06 ? "SubscribeEventgroup"
-                    : type == 0x07 ? "SubscribeEventgroupAck"
-                    : ("type=0x" + Integer.toHexString(type));
-            if (type == 0x06 || type == 0x07) {
-                int counter = d[off + 13] & 0x0f;
-                int eg = readShort(d, off + 14);
-                boolean ours = type == 0x06 && svc == SERVICE_ID;
-                // Рутинное обновление подписки на наш сервис в лог не идёт — только
-                // первое на каждую eventgroup и сводка раз в минуту (см. subSummary).
-                // Всё остальное, включая чужие сервисы, пишется как раньше.
-                boolean first = !ours || subSeen.add(Integer.valueOf(eg));
-                if (first) {
-                    say("<< " + from + " " + name + " svc=0x" + Integer.toHexString(svc)
-                            + " inst=" + inst + " major=" + maj + " ttl=" + entryTtl
-                            + " eventgroup=0x" + Integer.toHexString(eg) + " counter=" + counter);
-                }
-                if (ours) {
-                    subRenewals++;
-                    // Подписка на наш сервис — то, ради чего всё и затевалось.
-                    if (first) {
-                        say("*** ПОДПИСКА на 0x" + Integer.toHexString(svc) + " eventgroup 0x"
-                                + Integer.toHexString(eg) + " от " + from + " -> шлём Ack");
-                    }
-                    subSummary();
-                    try {
-                        byte[] ack = buildSubscribeAck(svc, inst, maj, entryTtl, counter, eg);
-                        sd.send(new DatagramPacket(ack, ack.length, p.getAddress(), SD_PORT));
-                    } catch (Exception e) {
-                        say("Ack: " + e);
-                    }
-                }
-            } else {
-                say("<< " + from + " " + name + " svc=0x" + Integer.toHexString(svc)
-                        + " inst=" + inst + " major=" + maj + " ttl=" + entryTtl);
-            }
-            off += 16;
-        }
-    }
 
-    // ------------------------------------------------------------------ сборка SD-сообщений
 
-    /** Общая шапка SOME/IP-SD: message id 0xFFFF8100, тип NOTIFICATION. */
-    static byte[] wrapSd(byte[] entries, byte[] options) {
-        int payloadLen = 4 /*flags+reserved*/ + 4 + entries.length + 4 + options.length;
-        byte[] m = new byte[16 + payloadLen];
-        int o = 0;
-        o = putShort(m, o, 0xFFFF);
-        o = putShort(m, o, 0x8100);
-        o = putInt(m, o, payloadLen + 8);   // length считается от requestId
-        o = putShort(m, o, 0x0000);         // client id
-        o = putShort(m, o, session++ & 0xFFFF);
-        m[o++] = 0x01;                      // protocol version
-        m[o++] = 0x01;                      // interface version
-        m[o++] = 0x02;                      // NOTIFICATION
-        m[o++] = 0x00;                      // return code
-        m[o++] = (byte) 0xC0;               // flags: reboot + unicast
-        m[o++] = 0; m[o++] = 0; m[o++] = 0; // reserved
-        o = putInt(m, o, entries.length);
-        System.arraycopy(entries, 0, m, o, entries.length); o += entries.length;
-        o = putInt(m, o, options.length);
-        System.arraycopy(options, 0, m, o, options.length);
-        return m;
-    }
 
-    static byte[] buildOffer(String ip, int port, int ttlSec) throws Exception {
-        byte[] e = new byte[16];
-        e[0] = 0x01;              // OfferService
-        e[1] = 0x00;              // index 1st option
-        e[2] = 0x00;              // index 2nd option
-        e[3] = 0x10;              // 1 опция в первом наборе, 0 во втором
-        putShort(e, 4, SERVICE_ID);
-        putShort(e, 6, INSTANCE_ID);
-        e[8] = (byte) MAJOR_VERSION;
-        e[9] = (byte) ((ttlSec >> 16) & 0xff);
-        e[10] = (byte) ((ttlSec >> 8) & 0xff);
-        e[11] = (byte) (ttlSec & 0xff);
-        putInt(e, 12, MINOR_VERSION);
-        return wrapSd(e, ipv4EndpointOption(ip, 0x06, port));
-    }
 
-    static byte[] buildSubscribeAck(int svc, int inst, int maj, int ttlSec, int counter, int eg) {
-        byte[] e = new byte[16];
-        e[0] = 0x07;              // SubscribeEventgroupAck
-        e[1] = 0x00;
-        e[2] = 0x00;
-        e[3] = 0x00;              // без опций
-        putShort(e, 4, svc);
-        putShort(e, 6, inst);
-        e[8] = (byte) maj;
-        e[9] = (byte) ((ttlSec >> 16) & 0xff);
-        e[10] = (byte) ((ttlSec >> 8) & 0xff);
-        e[11] = (byte) (ttlSec & 0xff);
-        e[12] = 0x00;
-        e[13] = (byte) (counter & 0x0f);
-        putShort(e, 14, eg);
-        return wrapSd(e, new byte[0]);
-    }
-
-    /** Опция «IPv4 endpoint»: 12 байт, поле длины всегда 0x0009. */
-    static byte[] ipv4EndpointOption(String ip, int proto, int port) throws Exception {
-        byte[] o = new byte[12];
-        putShort(o, 0, 0x0009);
-        o[2] = 0x04;              // type: IPv4 endpoint
-        o[3] = 0x00;              // reserved
-        byte[] a = InetAddress.getByName(ip).getAddress();
-        System.arraycopy(a, 0, o, 4, 4);
-        o[8] = 0x00;              // reserved
-        o[9] = (byte) proto;      // 0x06 TCP, 0x11 UDP
-        putShort(o, 10, port);
-        return o;
-    }
-
-    // ------------------------------------------------------------------ TCP и события
-
-    static void startTcpServer(final InetAddress bind, final int port) throws Exception {
-        final ServerSocket ss = new ServerSocket();
-        ss.setReuseAddress(true);
-        ss.bind(new InetSocketAddress(bind, port));
-        say("TCP-listener на " + ss.getLocalSocketAddress());
-        Thread t = new Thread(new Runnable() {
-            public void run() {
-                while (true) {
-                    try {
-                        Socket s = ss.accept();
-                        s.setTcpNoDelay(true);
-                        synchronized (clients) { clients.add(s); }
-                        say("*** TCP-подключение от " + s.getRemoteSocketAddress());
-                    } catch (Exception e) {
-                        say("accept: " + e);
-                        return;
-                    }
-                }
-            }
-        }, "tcp-accept");
-        t.setDaemon(true);
-        t.start();
-    }
 
     /** Монотонные секунды из /proc/uptime — как у твика; настенные часы головы прыгают. */
     static long uptimeSec() {
@@ -464,128 +219,58 @@ public final class TboxWire {
         } catch (Exception e) { /* tmpfs-мост, разовые ошибки не важны */ }
     }
 
-    static void startNotifier() {
-        Thread t = new Thread(new Runnable() {
-            public void run() {
-                int n = 0;
-                int tick = 0;
-                int phase = PHASE_IDLE;
-                while (true) {
-                    try {
-                        // Такт задаёт текущая фаза: на пяти секундах и «бег» палок, и
-                        // мигание выглядят не движением, а случайными скачками уровня.
-                        Thread.sleep(phase == PHASE_IDLE ? notifyMs : phaseTickMs(phase));
-                    } catch (InterruptedException e) { return; }
-                    Sig sig = readSignal();
-                    // Настоящего уровня ещё нет — значит, возможно, идёт одна из двух ранних
-                    // стадий, и вместо заглушки надо показать, что процесс живой.
-                    //
-                    // Стадии РОВНО ДВЕ и они не пересекаются: сначала приложение проверяет
-                    // adbd и раскладывает файлы (state/appboot=1), потом работает wwan-up.sh
-                    // (state/busy с живым pid). Приложение снимает appboot прямо перед
-                    // запуском подъёма, так что в норме одновременно они не стоят; но если
-                    // приложение почему-то не успело снять признак, побеждает подъём — он
-                    // позже и конкретнее. Порядок проверок ниже это и задаёт, поэтому
-                    // «моргание» не может перебить «бегущие палки».
-                    int next = PHASE_IDLE;
-                    if (!sig.measured) {
-                        String stage = bringUpStage();
-                        if (stage != null) {
-                            next = PHASE_BRINGUP;
-                            sig = new Sig(REG_STATUS_REGISTERED, connectingStrength(tick++),
-                                    "подключение: " + stage);
-                        } else if (appChecking()) {
-                            next = PHASE_APPCHECK;
-                            boolean full = (tick++ & 1) == 0;
-                            sig = full
-                                    ? new Sig(REG_STATUS_REGISTERED, 5, "автозапуск: проверки")
-                                    : new Sig(REG_NONE, -1, "автозапуск: проверки");
-                        }
-                    }
-                    // Фаза сменилась — счёт кадров начинается заново, иначе новая анимация
-                    // подхватывает чужой такт и первый кадр выпадает случайным.
-                    if (next != phase) tick = 0;
-                    phase = next;
-                    // Зеркалим текущий сигнал в tmpfs-файл для Frida-твика — независимо от того,
-                    // есть ли TCP-подписчики (при tbox=0 их и не будет, при tbox=1 будут оба).
-                    if (signalFile != null) writeSignalFile(sig);
-                    byte[] msg = buildNotification(buildPayload(sig.reg, ESIM_STATUS_OK,
-                            SERVICE_STATUS_CONNECTED, ROAMING_NONE, sig.strength, 0));
-                    n++;
-                    List<Socket> snapshot;
-                    synchronized (clients) { snapshot = new ArrayList<Socket>(clients); }
-                    if (snapshot.isEmpty()) {
-                        // Раньше — раз в шесть тактов; при полусекундном такте в фазе
-                        // подключения это набегало быстрее, чем успевало пригодиться.
-                        long nowNs = System.nanoTime();
-                        if (nowNs - lastIdleLogNs >= NOTIFY_HEARTBEAT_MS * 1000000L) {
-                            lastIdleLogNs = nowNs;
-                            say("событий не шлём: подписчиков по TCP пока нет");
-                        }
-                        continue;
-                    }
-                    for (Socket s : snapshot) {
-                        try {
-                            OutputStream os = s.getOutputStream();
-                            // Запись в сокет — единственное, что в этом такте ещё способно
-                            // заблокироваться (буфер отправки полон, а SystemUI не читает).
-                            // Измеряем: 2026-08-12 такт встал на 4 минуты 40 секунд, и по
-                            // логу нельзя было отличить залипание здесь от залипания в
-                            // опросе модема — строка пишется уже после flush.
-                            long t0 = System.nanoTime();
-                            os.write(msg);
-                            os.flush();
-                            long took = (System.nanoTime() - t0) / 1000000L;
-                            if (notifyWorthLogging(sig, took)) {
-                                say(">> #" + n + " reg=" + sig.reg + " strength=" + sig.strength
-                                        + " (" + sig.detail + ") -> " + s.getRemoteSocketAddress()
-                                        + (took >= SLOW_WRITE_WARN_MS ? "  [запись " + took + " мс]" : ""));
-                            }
-                        } catch (Exception e) {
-                            say("отвалился " + s.getRemoteSocketAddress() + ": " + e);
-                            synchronized (clients) { clients.remove(s); }
-                        }
-                    }
+    /**
+     * Такт записи сигнала в файл. Крутится в основном потоке: больше делать нечего.
+     *
+     * Фазы и анимация оставлены как были — они про то, ЧТО показывать, пока настоящего
+     * уровня ещё нет, и к способу доставки отношения не имеют.
+     */
+    static void runNotifier() {
+        int tick = 0;
+        int phase = PHASE_IDLE;
+        while (true) {
+            try {
+                // Такт задаёт текущая фаза: на пяти секундах и «бег» палок, и мигание
+                // выглядят не движением, а случайными скачками уровня.
+                Thread.sleep(phase == PHASE_IDLE ? notifyMs : phaseTickMs(phase));
+            } catch (InterruptedException e) { return; }
+            Sig sig = readSignal();
+            // Настоящего уровня ещё нет — значит, возможно, идёт одна из двух ранних
+            // стадий, и вместо заглушки надо показать, что процесс живой.
+            //
+            // Стадии РОВНО ДВЕ и они не пересекаются: сначала приложение проверяет adbd и
+            // раскладывает файлы (state/appboot=1), потом работает wwan-up.sh (state/busy с
+            // живым pid). Порядок проверок ниже задаёт приоритет: «моргание» не может
+            // перебить «бегущие палки».
+            int next = PHASE_IDLE;
+            if (!sig.measured) {
+                String stage = bringUpStage();
+                if (stage != null) {
+                    next = PHASE_BRINGUP;
+                    sig = new Sig(REG_STATUS_REGISTERED, connectingStrength(tick++),
+                            "подключение: " + stage);
+                } else if (appChecking()) {
+                    next = PHASE_APPCHECK;
+                    boolean full = (tick++ & 1) == 0;
+                    sig = full
+                            ? new Sig(REG_STATUS_REGISTERED, 5, "автозапуск: проверки")
+                            : new Sig(REG_NONE, -1, "автозапуск: проверки");
                 }
             }
-        }, "notify");
-        t.setDaemon(true);
-        t.start();
+            // Фаза сменилась — счёт кадров начинается заново, иначе новая анимация
+            // подхватывает чужой такт и первый кадр выпадает случайным.
+            if (next != phase) tick = 0;
+            phase = next;
+
+            writeSignalFile(sig);
+            if (notifyWorthLogging(sig)) {
+                say("сигнал: reg=" + sig.reg + " strength=" + sig.strength
+                        + " (" + sig.detail + ")");
+            }
+        }
     }
 
-    static byte[] buildNotification(byte[] payload) {
-        byte[] m = new byte[16 + payload.length];
-        int o = 0;
-        o = putShort(m, o, SERVICE_ID);
-        o = putShort(m, o, EVENT_ID);
-        o = putInt(m, o, 8 + payload.length);
-        o = putShort(m, o, 0x0000);          // client id
-        o = putShort(m, o, session++ & 0xFFFF);
-        m[o++] = 0x01;                       // protocol version
-        m[o++] = 0x01;                       // interface version
-        m[o++] = 0x02;                       // NOTIFICATION
-        m[o++] = 0x00;                       // return code
-        System.arraycopy(payload, 0, m, o, payload.length);
-        return m;
-    }
 
-    /**
-     * 16 байт CellularNetworkInfo (профиль SomeipTransformationProps_INI_CellularNetwork:
-     * 8BIT alignment, big endian, у пустого apnArray остаётся только 4-байтовый префикс
-     * длины).
-     */
-    static byte[] buildPayload(int reg, int esim, int svcStatus, int roaming, int strength, int apnCount) {
-        byte[] b = new byte[16];
-        int o = 0;
-        b[o++] = (byte) reg;
-        o = putInt(b, o, esim);
-        b[o++] = (byte) svcStatus;
-        b[o++] = (byte) roaming;
-        b[o++] = (byte) strength;
-        o = putInt(b, o, apnCount);
-        putInt(b, o, 0);          // длина apnArray в байтах
-        return b;
-    }
 
     // ================================================================== опрос модема ====
     //
@@ -642,7 +327,6 @@ public final class TboxWire {
     /** Сколько ждать опрос модема, прежде чем считать это ненормальным и записать в лог. */
     static final int SLOW_POLL_WARN_MS = 5000;
     /** То же для записи в сокет подписчика — там нормой являются единицы миллисекунд. */
-    static final int SLOW_WRITE_WARN_MS = 1000;
 
     /**
      * Единственное место, где происходит блокирующий разговор с модемом.
@@ -1188,18 +872,11 @@ public final class TboxWire {
     static void parseArgs(String[] a) {
         for (int i = 0; i < a.length; i++) {
             String s = a[i];
-            if ("--src".equals(s)) srcIp = a[++i];
-            else if ("--peer".equals(s)) peerIp = a[++i];
-            else if ("--iface".equals(s)) ifaceName = a[++i];
-            else if ("--tcp-port".equals(s)) tcpPort = Integer.parseInt(a[++i]);
-            else if ("--offer-ms".equals(s)) offerMs = Integer.parseInt(a[++i]);
-            else if ("--notify-ms".equals(s)) notifyMs = Integer.parseInt(a[++i]);
-            else if ("--ttl".equals(s)) ttl = Integer.parseInt(a[++i]);
+            if ("--notify-ms".equals(s)) notifyMs = Integer.parseInt(a[++i]);
             else if ("--strength".equals(s)) fixedStrength = Integer.parseInt(a[++i]);
             else if ("--wwan-dir".equals(s)) wwanDir = a[++i];
             else if ("--gw".equals(s)) gwOverride = a[++i];
             else if ("--reg".equals(s)) regOverride = Integer.parseInt(a[++i]);
-            else if ("--probe".equals(s)) probeOnly = true;
             else if ("--signal".equals(s)) signalOnly = true;
             else if ("--signal-file".equals(s)) signalFile = a[++i];
             else throw new IllegalArgumentException("неизвестный аргумент: " + s);

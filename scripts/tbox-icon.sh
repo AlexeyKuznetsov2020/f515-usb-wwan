@@ -7,16 +7,17 @@
 #   tbox-icon.sh status                       работает или нет + последние строки лога
 #   tbox-icon.sh signal                       разовый опрос модема, ничего не запуская
 #   tbox-icon.sh fake N                       показать фиксированные N палок (проверка)
-#   tbox-icon.sh capable                      умеет ли эта голова показать иконку вообще
 #
 # Выключатель — файл state/icon со словом on/off внутри (а не «есть файл/нет файла»:
 # в этом проекте запрещено удалять что-либо, а выключатель должен сниматься). Пока там
 # off, `auto` молчит, и модем поднимается без всякой иконки. Файла нет — считаем on.
-# В этом форке иконка включена по умолчанию и в режиме bridge (машина без опции TBOX,
-# рисует твик iSpaceToolbox): `auto` стартует, пока в state/icon явно не написано off.
+# `auto` стартует, пока в state/icon явно не написано off.
 #
-# Под капотом — tboxwire.jar: он притворяется блоком TBOX, которого на стенде нет, и шлёт
-# голове по SOME/IP цифры нашего модема. Подробности — docs/status-icon.md.
+# Под капотом — tboxwire.jar: он опрашивает модем и пишет уровень сигнала в файл
+# $SIGNAL_BRIDGE, откуда его читает Frida-твик iSpaceToolbox «Статус сети» и рисует иконку.
+# Эмуляции блока TBOX по SOME/IP в этом форке нет: на нашей машине TBOX не заявлен
+# (config tbox=0), штатной иконки в панели не существует, и оферить было некому.
+# Подробности — docs/status-icon.md.
 #
 # ПОРЯДОК АРГУМЕНТОВ app_process. Каталог приложения идёт ПЕРЕД опциями:
 #     app_process /system/bin --nice-name=tboxwire TboxWire ...
@@ -24,105 +25,22 @@
 # app_main.cpp примет "/system/bin" за имя класса и процесс молча упадёт с кодом 1,
 # ничего не написав ни в stdout, ни в logcat. На этом уже потеряли полчаса.
 #
-# АЛИАС .37. Пакеты должны идти не с 192.168.62.4 — это адрес самой головы. Поэтому на
-# vlan62 вешается secondary-адрес 192.168.62.37 (в permanent-ARP QNX на vlan62 значатся
-# .1, .5, .10, .14, .37; .5 — QNX, .4 — Android; физического TBOX на стенде нет).
-# Алиас переживает только до перезагрузки, поэтому вешаем его при каждом старте.
 set -u
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 STATE=${WWAN_STATE:-$DIR/state}
 JAR=${TBOX_JAR:-$DIR/tboxwire.jar}
-SRC_IP=${TBOX_SRC:-192.168.62.37}
-IFACE=${TBOX_IFACE:-vlan62}
 LOG=$STATE/tbox.log
 PIDFILE=$STATE/tbox.pid
 SWITCH=$STATE/icon
-CAP_CACHE=$STATE/icon-capable
-# «Новый путь» для машины БЕЗ опции TBOX (config tbox=0): tmpfs-файл, который читает Frida-твик
-# iSpaceToolbox «Статус сети» и рисует иконку в статус-баре напрямую (штатная цепочка ID_CELLULAR_*
-# там мертва). tmpfs (/dev), НЕ /data/local/tmp — файл переписывается каждые несколько секунд, а
-# /data/local/tmp на этой голове — флеш. Формат — см. TboxWire.writeSignalFile / твик.
+# Файл сигнала: его читает Frida-твик iSpaceToolbox «Статус сети» и рисует иконку в
+# статус-баре. tmpfs (/dev), НЕ /data/local/tmp — переписывается каждые несколько секунд,
+# а /data/local/tmp на этой голове флеш. Формат — см. TboxWire.writeSignalFile / твик.
 SIGNAL_BRIDGE=${TBOX_SIGNAL_FILE:-/dev/network-status-signal}
 
 mkdir -p "$STATE" 2>/dev/null
 
 enabled() { [ "$(cat "$SWITCH" 2>/dev/null)" != off ]; }
-
-# --- умеет ли эта голова показать штатную иконку вообще ----------------------
-#
-# Не на всякой машине сотовая иконка в панели есть. SystemUI заводит её, только если
-# внутренний ключ ID_CELLULAR_ENABLE равен 1, иначе не подписывается на ID_CELLULAR_*
-# и не создаёт вью — в панели не крестик, а пустое место. Наши цифры при этом доезжают
-# до com.tbox.service целыми (видно в logcat), но слушателей у события ноль.
-#
-# Проверено 2026-08-12 на голове с 3G-модемом: прошивка панели там байт в байт наша,
-# отличается ровно один ключ конфигурации машины. Разбор — recon/colleague-head/README.md.
-#
-# Спрашиваем саму голову, а не гадаем: провайдер publicadapter отдаёт ID_CELLULAR_ENABLE
-# либо числом, либо JS-выражением над проперти машины (их считает Rhino в PersistenceUtil).
-# Число — верим как есть; выражение — считаем сами по пропертям.
-CAPABLE_WHY=
-CAPABLE_SURE=1
-
-cell_enable_expr() {
-	timeout 10 content query --uri content://com.seres.publicadapter.provider/config_inner 2>/dev/null |
-		sed -n 's/.*"ID_CELLULAR_ENABLE"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' |
-		tr -d '"' | head -1
-}
-
-# 0 — иконка возможна, 1 — нет. Человеческая причина остаётся в $CAPABLE_WHY.
-capable_probe() {
-	CAPABLE_SURE=1
-	_expr=$(cell_enable_expr)
-	case "$_expr" in
-	1) CAPABLE_WHY="ID_CELLULAR_ENABLE=1"; return 0 ;;
-	0) CAPABLE_WHY="ID_CELLULAR_ENABLE=0 — панель не создаёт сотовую иконку"; return 1 ;;
-	esac
-
-	_tbox=$(getprop seres.platform.config.tbox 2>/dev/null)
-	_region=$(getprop persist.seres.platform.config.region.code 2>/dev/null)
-	# Пусто — значит прошивка устроена иначе, чем мы знаем. Тогда не мешаем работать:
-	# выключить иконку там, где она работала, хуже, чем зря погонять эмуляцию.
-	if [ -z "$_tbox" ]; then
-		# Не кешируем: на раннем старте провайдер и vehicle-HAL могут быть ещё не готовы,
-		# и залипнуть на догадке до конца загрузки было бы хуже, чем спросить ещё раз.
-		CAPABLE_SURE=0
-		CAPABLE_WHY="конфиг машины не прочитался — считаем, что иконка есть"
-		return 0
-	fi
-	if [ "$_tbox" != 1 ]; then
-		CAPABLE_WHY="в машине не заявлен TBOX (config tbox=$_tbox) — иконки в панели нет"
-		return 1
-	fi
-	if [ "$_region" = 4 ]; then
-		CAPABLE_WHY="регион $_region — сотовая иконка выключена прошивкой"
-		return 1
-	fi
-	CAPABLE_WHY="config tbox=1, регион ${_region:-неизвестен}"
-	return 0
-}
-
-# Кеш привязан к boot_id: проперти машины выставляет vehicle-HAL при загрузке и внутри
-# одной загрузки они не меняются, а state/ переживает перезагрузку — без привязки кеш
-# протух бы незаметно.
-capable() {
-	if [ "${TBOX_ICON_FORCE:-0}" = 1 ]; then
-		CAPABLE_WHY="принудительно (TBOX_ICON_FORCE=1)"
-		return 0
-	fi
-	_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
-	_c=$(cat "$CAP_CACHE" 2>/dev/null)
-	if [ -n "$_boot" ] && [ "${_c%% *}" = "$_boot" ]; then
-		_rest=${_c#* }
-		CAPABLE_WHY=${_rest#* }
-		[ "${_rest%% *}" = 1 ]
-		return $?
-	fi
-	if capable_probe; then _v=1; else _v=0; fi
-	[ "$CAPABLE_SURE" = 1 ] && echo "$_boot $_v $CAPABLE_WHY" >"$CAP_CACHE" 2>/dev/null
-	[ "$_v" = 1 ]
-}
 
 running_pid() {
 	# pidof надёжнее pidfile: имя процесса задаёт --nice-name, и переживает оно всё.
@@ -136,21 +54,10 @@ need_jar() {
 	}
 }
 
-add_alias() {
-	if ip -4 -o addr show dev "$IFACE" 2>/dev/null | grep -q " $SRC_IP/"; then
-		return 0
-	fi
-	echo "== вешаем $SRC_IP на $IFACE"
-	ip addr add "$SRC_IP/24" dev "$IFACE" label "$IFACE:tbox" || {
-		echo "не смог добавить адрес — нужен root" >&2
-		exit 1
-	}
-}
-
 # Один и тот же запуск и для start, и для fake/signal: разница только в аргументах.
 java_run() {
 	exec env CLASSPATH="$JAR" app_process /system/bin --nice-name=tboxwire TboxWire \
-		--src "$SRC_IP" --iface "$IFACE" --wwan-dir "$DIR" "$@"
+		--wwan-dir "$DIR" "$@"
 }
 
 case "${1:-status}" in
@@ -159,17 +66,9 @@ start)
 	need_jar
 	PID=$(running_pid)
 	[ -n "$PID" ] && { echo "уже работает, pid $PID (остановить: $0 stop)"; exit 0; }
-	# Работаем ОБОИМИ путями сразу, независимо от режима:
-	#   SOME/IP  — штатная цепочка, на машине с TBOX панель рисует иконку сама;
-	#   мост в файл ($SIGNAL_BRIDGE) — его читает Frida-твик iSpaceToolbox «Статус сети»
-	#              и рисует иконку сам, там где штатной цепочки нет (tbox=0).
-	# Раньше мост включался только при tbox=0, по ответу capable, — и в этом была беда:
-	# на раннем старте конфиг машины может ещё не читаться, capable тогда отвечает «иконка
-	# есть» (native) и ответ не кеширует, а режим выбирался один раз, при старте. Процесс
-	# так и оставался бы без моста до ручного рестарта, то есть после ребута иконки просто
-	# не было бы. Запись в tmpfs раз в 5 с не стоит ничего, а лишним быть не может: если
-	# твик не установлен, файл никто не читает. Поэтому пишем всегда, а capable ниже решает
-	# только один вопрос — поднимать ли поллер самим (`auto`).
+	# Сигнал всегда пишется в файл: его читает твик iSpaceToolbox и рисует иконку.
+	# Запись в tmpfs раз в 5 с не стоит ничего, а лишней быть не может — если твик не
+	# установлен, файл просто никто не читает.
 	# chmod отдельной командой, а не через `&&`: файл мог остаться с прошлого запуска
 	# (в /dev, но с правами 600 от того, кто создал его первым) — тогда `: >` его только
 	# усечёт, а права надо всё равно поправить, иначе SystemUI молча не прочитает.
@@ -177,13 +76,8 @@ start)
 	chmod 666 "$SIGNAL_BRIDGE" 2>/dev/null
 	# Кавычки внутри строки для `sh -c`: путь задаётся снаружи ($TBOX_SIGNAL_FILE).
 	EXTRA="--signal-file '$SIGNAL_BRIDGE'"
-	if capable; then
-		echo "режим: штатная цепочка ($CAPABLE_WHY)"
-	else
-		echo "режим: мост в файл — $CAPABLE_WHY"
-		echo "иконку рисует твик iSpaceToolbox «Статус сети» из $SIGNAL_BRIDGE (без него не видно)"
-	fi
-	add_alias
+	echo "сигнал пишется в $SIGNAL_BRIDGE"
+	echo "иконку рисует твик iSpaceToolbox «Статус сети» (без него файл просто никто не читает)"
 	# Логи только дописываются, logrotate на голове нет. Старт — самая удобная
 	# точка усечения: файл ещё никем не открыт, а дальше в него будет писать
 	# живой процесс (в цикле за размером следит watchdog в wwan-boot.sh).
@@ -197,7 +91,7 @@ start)
 	# setsid + закрытый stdin: процесс должен пережить обрыв adb-сессии, из которой
 	# его запустили. Именно так приложение стартует и wwan-boot.sh.
 	setsid sh -c "CLASSPATH=$JAR exec app_process /system/bin --nice-name=tboxwire \
-		TboxWire --src $SRC_IP --iface $IFACE --wwan-dir $DIR $EXTRA $*" \
+		TboxWire --wwan-dir $DIR $EXTRA $*" \
 		</dev/null >>"$LOG" 2>&1 &
 	i=0
 	while [ $i -lt 10 ]; do
@@ -222,12 +116,7 @@ auto)
 	enabled || { echo "иконка выключена (state/icon=off)"; exit 0; }
 	[ -f "$JAR" ] || { echo "иконка: нет $JAR, пропускаем"; exit 0; }
 	[ -n "$(running_pid)" ] && exit 0
-	# Раньше здесь стоял `capable || exit` — чтобы на голове без TBOX не гонять AT-порт впустую.
-	# Мост в файл пишется теперь всегда (см. `start`), поэтому от ответа capable зависит ровно
-	# одно: поднимать ли поллер САМИМ. Апстрим сделал это опт-ином для bridge (только после явного
-	# «Включить»); в этом форке иконка включена по умолчанию и в bridge тоже — на нашей голове твик
-	# iSpaceToolbox стоит и мост нужен сразу после ребута. Единственный выключатель — state/icon=off
-	# (проверен `enabled` выше).
+	# Единственный выключатель — state/icon=off (проверен `enabled` выше).
 	sh "$0" start >/dev/null 2>&1 || echo "иконка: запустить не вышло, см. $LOG"
 	;;
 
@@ -256,17 +145,12 @@ status)
 	fi
 	echo "running=$([ -n "$PID" ] && echo 1 || echo 0)"
 	echo "enabled=$(enabled && echo 1 || echo 0)"
-	# capable = штатная цепочка (config tbox=1). mode = КЕМ рисуется иконка: native — штатной
-	# панелью (tbox=1), bridge — твиком iSpaceToolbox из файла-моста (tbox=0). Отдаём мы при
-	# этом всегда и то, и другое: SOME/IP и файл. В обоих режимах иконку МОЖНО показать,
-	# поэтому приложение не блокирует «Включить».
-	if capable; then echo "capable=1"; echo "mode=native"; else echo "capable=0"; echo "mode=bridge"; fi
-	echo "capable_why=$CAPABLE_WHY"
-	# Поднимет ли её `auto` сам после подъёма модема. В этом форке — всегда, пока иконка не
-	# выключена (state/icon=off), одинаково для native и bridge.
+	# Поднимет ли иконку `auto` сам после подъёма модема: всегда, пока не выключена
+	# явно (state/icon=off).
 	if enabled; then echo "autostart=1"; else echo "autostart=0"; fi
-	echo "алиас:    $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | grep " $SRC_IP/" |
-		sed 's/  */ /g' || echo "нет $SRC_IP на $IFACE")"
+	echo "файл:     $(ls -l "$SIGNAL_BRIDGE" 2>/dev/null | sed 's/  */ /g' ||
+		echo "нет $SIGNAL_BRIDGE (иконка не запускалась)")"
+	echo "сигнал:   $(cat "$SIGNAL_BRIDGE" 2>/dev/null || echo "—")"
 	echo "WAN:      $(cat "$STATE/wan-iface" 2>/dev/null || echo "неизвестен (модем не поднимали)")"
 	# Пока тут живой pid wwan-up.sh, иконка вместо крестика гоняет палки по кругу.
 	_b=$(cat "$STATE/busy" 2>/dev/null)
@@ -288,23 +172,12 @@ fake)
 	shift
 	N=${1:-4}
 	need_jar
-	add_alias
 	echo "показываем фиксированные $N палок, Ctrl-C чтобы прекратить"
 	# Файл-мост нужен и здесь: на машине без штатной иконки это единственный
 	# способ увидеть проверочные палки — рисует их твик, а не панель.
 	: >"$SIGNAL_BRIDGE" 2>/dev/null
 	chmod 666 "$SIGNAL_BRIDGE" 2>/dev/null
 	java_run --signal-file "$SIGNAL_BRIDGE" --strength "$N"
-	;;
-
-capable)
-	if capable; then
-		echo "режим native: штатная иконка панели — $CAPABLE_WHY"
-	else
-		echo "режим bridge: штатной цепочки нет ($CAPABLE_WHY),"
-		echo "иконку рисует твик iSpaceToolbox «Статус сети» из файла-моста $SIGNAL_BRIDGE"
-		# НЕ exit 1: раньше это означало «иконки нет вообще», теперь — «другой путь».
-	fi
 	;;
 
 -h | --help | help)

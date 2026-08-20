@@ -372,36 +372,18 @@ public class MainActivity extends Activity {
 
     private void showIconDialog(String status) {
         final boolean running = value(status, "running").equals("1");
-        // Два режима (см. tbox-icon.sh): native — штатная панель рисует иконку сама
-        // (config tbox=1); bridge — опция TBOX выключена, штатно панель иконку не создаёт, но её
-        // рисует твик iSpaceToolbox «Статус сети» из файла-моста, который мы пишем. В ОБОИХ
-        // режимах иконку можно включить — раньше на bridge «Включить» блокировали, исправлено.
-        String mode = value(status, "mode");
-        if (mode.isEmpty()) mode = value(status, "capable").equals("0") ? "bridge" : "native";
-        final boolean bridge = mode.equals("bridge");
-
         StringBuilder msg = new StringBuilder();
-        msg.append("Штатная иконка мобильной сети показывает сигнал USB-модема ")
-                .append("вместо крестика: голове отдаётся то, что в машине отдавал бы блок TBOX.\n\n");
-        if (bridge) {
-            msg.append("Опция TBOX в машине выключена (").append(value(status, "capable_why"))
-                    .append("), штатная панель иконку не создаёт. Её рисует твик iSpaceToolbox ")
-                    .append("«Статус сети» из файла-моста — включите этот твик в тулбоксе, ")
-                    .append("иначе иконки не будет.\n\n");
-        } else {
-            msg.append("Штатная панель рисует иконку сама (config tbox=1).\n\n");
-        }
+        msg.append("Иконка мобильной сети показывает сигнал USB-модема. Уровень пишется в ")
+                .append("файл, а рисует иконку твик iSpaceToolbox «Статус сети» — включите ")
+                .append("его в тулбоксе, иначе иконки не будет.\n\n");
         msg.append("Сейчас: ").append(running ? "работает" : "не запущена").append('\n');
-        // Не `enabled`: в bridge сама она после ребута не поднимется, пока её хоть раз не
-        // включили здесь кнопкой (иначе поллер зря занимал бы AT-порт модема). Ответ на этот
-        // вопрос целиком считает скрипт — поле autostart; enabled оставлен для старых версий.
+        // Ответ на «поднимется ли сама после ребута» целиком считает скрипт — поле
+        // autostart; enabled оставлен для совместимости со старыми версиями.
         String autostart = value(status, "autostart");
         if (autostart.isEmpty()) autostart = value(status, "enabled");
         msg.append("После подъёма модема: ").append(autostart.equals("1")
                 ? "включается сама"
-                : bridge && !value(status, "enabled").equals("0")
-                        ? "не включается (включите один раз кнопкой ниже)"
-                        : "не включается (выключено вручную)").append('\n');
+                : "не включается (выключено вручную)").append('\n');
         msg.append("\nНа сам интернет это никак не влияет — только на картинку в статус-баре.");
 
         AlertDialog.Builder b = new AlertDialog.Builder(this)
