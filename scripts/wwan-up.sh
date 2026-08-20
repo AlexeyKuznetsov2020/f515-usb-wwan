@@ -26,6 +26,8 @@
 #   wwan-up.sh --dns        показать, какой DNS выдаётся приложениям
 #   wwan-up.sh --dns=1.1.1.1  запомнить кастомный DNS и применить его сейчас
 #   wwan-up.sh --dns=auto   вернуться к DNS оператора/модема (см. docs/app-network.md)
+#   wwan-up.sh --usb-reset  жёсткий USB-ресет модема (authorized 0/1) и выход; для
+#                           watchdog'а, когда мягкий --reconnect не оживил модем
 #
 # Настройки: переменные окружения или /data/local/tmp/wwan.conf (см. wwan.conf.example).
 
@@ -84,6 +86,7 @@ DO_WIFI_PRIO=0
 DO_DNS=0
 DNS_SET=0
 DO_RECONNECT=0
+DO_USB_RESET=0
 for a in "$@"; do
 	case "$a" in
 	-c | --check)     CHECK_ONLY=1 ;;
@@ -91,6 +94,7 @@ for a in "$@"; do
 	-r | --reconnect) DO_RECONNECT=1 ;;
 	--down)           DO_DOWN=1 ;;
 	--boot)           BOOT_MODE=1 ;;
+	--usb-reset)      DO_USB_RESET=1 ;;
 	--wifi-prio)      DO_WIFI_PRIO=1 ;;
 	--dns)            DO_DNS=1 ;;
 	# Значение с аргументом главнее и wwan.conf, и файла: человек только что
@@ -439,6 +443,64 @@ find_usb_dev() {
 		return 0
 	done
 	return 1
+}
+
+# Каталог USB-УСТРОЙСТВА модема (тот, где лежит idVendor), а не его интерфейса:
+# authorized/unbind живут на устройстве, не на eth1/ttyUSB. Для жёсткого ресета.
+usb_dev_node() {
+	# HiLink: от сетевого интерфейса вверх по дереву sysfs до каталога с idVendor
+	# (vendor-agnostic — годится и для ZTE, и для Huawei-NCM).
+	if find_hilink_iface; then
+		_ud=$(readlink -f "/sys/class/net/$HILINK_IF/device" 2>/dev/null)
+		_ud_n=0
+		while [ -n "$_ud" ] && [ "$_ud" != / ] && [ "$_ud_n" -lt 12 ]; do
+			[ -f "$_ud/idVendor" ] && { echo "$_ud"; return 0; }
+			_ud=$(dirname "$_ud")
+			_ud_n=$((_ud_n + 1))
+		done
+	fi
+	# PPP-свисток Huawei: по vendor 12d1.
+	find_usb_dev && { echo "$USB_DEV"; return 0; }
+	return 1
+}
+
+# Жёсткий USB-ресет модема: де-авторизация + повторная авторизация USB-устройства
+# (echo 0/1 > authorized). Ядро сносит ВСЕ интерфейсы и драйверы устройства и
+# заново его энумерирует — как физическое перевтыкание. Мягкий `ip link down/up`
+# (--reconnect) зависшую прошивку модема не оживляет, а это оживляет. Для Huawei
+# ресет вернёт модем в storage-режим — обычный подъём следом сделает modeswitch и
+# реинициализацию. Запасной путь, если authorized недоступен, — unbind/bind у
+# драйвера usb. Реинициализацию тут НЕ делаем: это отдельный короткий режим.
+usb_reset() {
+	_ur_dev=$(usb_dev_node) || { warn "USB-устройство модема не найдено — ресетить нечего"; return 1; }
+	_ur_name=$(basename "$_ur_dev")
+	say "жёсткий USB-ресет: $_ur_name ($_ur_dev)"
+	if [ "$CHECK_ONLY" = 1 ]; then
+		say "   [dry ] echo 0/1 > $_ur_dev/authorized (или unbind/bind $_ur_name у драйвера usb)"
+		return 0
+	fi
+	if [ -w "$_ur_dev/authorized" ]; then
+		say "   echo 0 > $_ur_dev/authorized"
+		echo 0 >"$_ur_dev/authorized" 2>/dev/null || warn "не смог снять authorized"
+		sleep 2
+		say "   echo 1 > $_ur_dev/authorized"
+		echo 1 >"$_ur_dev/authorized" 2>/dev/null || warn "не смог вернуть authorized"
+	else
+		say "   authorized недоступен — unbind/bind драйвера usb ($_ur_name)"
+		printf %s "$_ur_name" >/sys/bus/usb/drivers/usb/unbind 2>/dev/null || warn "unbind не сработал"
+		sleep 2
+		printf %s "$_ur_name" >/sys/bus/usb/drivers/usb/bind 2>/dev/null || warn "bind не сработал"
+	fi
+	# Ждём возврата устройства на шину (Huawei вернётся в storage-режиме).
+	_ur_i=0
+	while [ "$_ur_i" -lt 20 ]; do
+		if find_usb_dev; then ok "модем на шине: $USB_VID:$USB_PID"; return 0; fi
+		if find_hilink_iface; then ok "сетевой интерфейс вернулся: $HILINK_IF"; return 0; fi
+		sleep 1
+		_ur_i=$((_ur_i + 1))
+	done
+	warn "после USB-ресета устройство не появилось за 20 с — подъём попробует сам"
+	return 0
 }
 
 # ttyUSB, соответствующий интерфейсу с заданным bInterfaceProtocol
@@ -817,6 +879,15 @@ if [ "$DO_DOWN" = 1 ]; then
 	say "   ip route del default table $TABLE"
 	say "   ip rule del oif ppp0 table $TABLE"
 	exit 0
+fi
+
+# --------------------------------------------------------------- --usb-reset --
+# Короткий режим для watchdog'а: только жёсткий ресет модема, без подъёма. Подъём
+# (modeswitch, модули, DHCP) делает обычный заход wwan-up.sh следом — он сам
+# увидит вернувшийся в storage-режим модем и переинициализирует его.
+if [ "$DO_USB_RESET" = 1 ]; then
+	usb_reset
+	exit $?
 fi
 
 # Раз в запуск, до первой строки: заход добавляет пару килобайт, так что чаще

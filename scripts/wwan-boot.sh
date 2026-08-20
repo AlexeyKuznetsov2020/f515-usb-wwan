@@ -169,27 +169,57 @@ iface_addr() { ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ 
 # интернета, когда с нашей стороны всё настроено.
 MODEM_FAILS=$STATE/modem-fails
 MODEM_STATUS=$STATE/modem-status
+MODEM_RECOVERIES=$STATE/modem-recoveries   # подряд восстановлений зависшего модема (сброс при ответе)
 MODEM_MAX_FAILS=${WWAN_MODEM_MAX_FAILS:-3}
+# Сколько МЯГКИХ реконнектов (`ip link down/up` + DHCP) пробуем, прежде чем перейти
+# на ЖЁСТКИЙ USB-ресет (authorized 0/1). 1 = один мягкий, дальше жёсткие, пока не
+# оживёт. Мягкий дешевле и часто хватает; жёсткий лечит настоящее зависание прошивки.
+MODEM_SOFT_TRIES=${WWAN_MODEM_SOFT_TRIES:-1}
 
-# Шлюз модема: он же адрес его веб-морды. Берём из маршрута, а не из догадки
-# «первый адрес подсети» — у ZTE и Huawei подсети разные.
+# Шлюз модема: он же адрес его веб-морды.
+#
+# 1) Сначала реальный default-маршрут модема — в ЛЮБОЙ таблице (table all уже
+#    включает и 99, и main). Раньше смотрели только 99+main, и это была дыра: при
+#    Wi-Fi-приоритете дефолт модема из main убран (Wi-Fi — основной канал), а в
+#    table 99 после реконнекта его может не оказаться. Тогда modem_gw возвращал
+#    пусто, вызывающий код (`if [ -n "$GW" ]`) МОЛЧА пропускал проверку зависания —
+#    и завис­ший модем (веб-API мёртв, интерфейс с адресом жив) никто не рестартовал.
+# 2) Если маршрута нет вовсе — берём .1 СВОЕЙ подсети из адреса интерфейса. Это не
+#    «догадка про подсеть» (её и опасался прежний комментарий): адрес берётся живой,
+#    поэтому у Huawei на 192.168.1.x выйдет 192.168.1.1, у ZTE на 192.168.0.x —
+#    192.168.0.1. Ровно так же добывает шлюз сам wwan-up.sh. Переопределить —
+#    WWAN_HILINK_GW.
 modem_gw() {
-	for _mg_t in "${WWAN_TABLE:-99}" main; do
-		ip route show table "$_mg_t" 2>/dev/null |
-			sed -n "s/^default via \([0-9.]*\) dev $1 .*/\1/p" | head -1
-	done | grep -m1 '[0-9]'
+	_mg=$(ip route show table all 2>/dev/null |
+		sed -n "s/^default via \([0-9.]*\) dev $1 .*/\1/p" | head -1)
+	if [ -z "$_mg" ] && [ -n "${WWAN_HILINK_GW:-}" ]; then
+		_mg=$WWAN_HILINK_GW
+	fi
+	if [ -z "$_mg" ]; then
+		_mg_a=$(iface_addr "$1")
+		[ -n "$_mg_a" ] && _mg=$(echo "$_mg_a" | sed 's/\.[0-9]*$/.1/')
+	fi
+	[ -n "$_mg" ] && echo "$_mg"
 }
 
 # Печатает ConnectionStatus и возвращает 0, если модем ответил; 1 — если молчит.
 # Huawei и ZTE отвечают по разным путям, поэтому пробуем оба и не привередничаем
 # к содержимому: важен сам факт, что на том конце кто-то живой.
 modem_probe() {
-	_mp_b=$(curl -s -m 5 "http://$1/api/monitoring/status" 2>/dev/null)
-	case "$_mp_b" in
-	*"<ConnectionStatus>"*)
-		echo "$_mp_b" | sed -n 's#.*<ConnectionStatus>\([0-9]*\)</ConnectionStatus>.*#\1#p' | head -1
-		return 0 ;;
-	esac
+	# Huawei: статус лежит на ОДНОМ ИЗ ДВУХ путей (зависит от прошивки: на части
+	# коротким /api/monitor/status отвечает, на части — только длинным). Пробуем оба,
+	# как это делает tboxwire.jar (HUAWEI_STATUS). Иначе живой модем на «неправильном»
+	# пути считался бы зависшим — и теперь, когда шлюз определяется всегда, это давало
+	# бы ложные рестарты каждые $MODEM_MAX_FAILS такта.
+	for _mp_p in /api/monitoring/status /api/monitor/status; do
+		_mp_b=$(curl -s -m 5 "http://$1$_mp_p" 2>/dev/null)
+		case "$_mp_b" in
+		*"<ConnectionStatus>"*)
+			echo "$_mp_b" | sed -n 's#.*<ConnectionStatus>\([0-9]*\)</ConnectionStatus>.*#\1#p' | head -1
+			return 0 ;;
+		esac
+	done
+	# ZTE: свой goform-эндпоинт.
 	_mp_b=$(curl -s -m 5 "http://$1/goform/goform_get_cmd_process?cmd=ppp_status" 2>/dev/null)
 	case "$_mp_b" in
 	*ppp_status*) echo ""; return 0 ;;
@@ -242,7 +272,7 @@ case "$1" in
 	echo "wan_addr=$([ -n "$_if" ] && iface_addr "$_if")"
 	exit 0 ;;
 --reset)
-	rm -f "$DISABLED" "$INFLIGHT" "$RESTARTS"
+	rm -f "$DISABLED" "$INFLIGHT" "$RESTARTS" "$MODEM_FAILS" "$MODEM_RECOVERIES"
 	echo 0 >"$ATTEMPTS"
 	sync
 	log "защита сброшена вручную, автозапуск снова разрешён"
@@ -472,6 +502,7 @@ while :; do
 
 	ADDR=$(iface_addr "$IF")
 	HARD=0
+	HARD_HANG=0   # 1 только для «модем не отвечает на веб-API» — тогда доступна эскалация до USB-ресета
 	if [ -z "$ADDR" ]; then
 		HARD=1
 		REASON="у $IF нет адреса"
@@ -507,6 +538,9 @@ while :; do
 		if [ -n "$GW" ]; then
 			if CONN=$(modem_probe "$GW"); then
 				[ "$(cat "$MODEM_FAILS" 2>/dev/null)" = 0 ] || echo 0 >"$MODEM_FAILS" 2>/dev/null
+				# Модем снова отвечает — эскалацию начинаем с нуля (следующее зависание
+				# опять сперва лечим мягко).
+				[ "$(cat "$MODEM_RECOVERIES" 2>/dev/null)" = 0 ] || echo 0 >"$MODEM_RECOVERIES" 2>/dev/null
 				# В лог — только смена состояния: такт частый, а строки вечные.
 				if [ "$(cat "$MODEM_STATUS" 2>/dev/null)" != "$CONN" ]; then
 					echo "$CONN" >"$MODEM_STATUS" 2>/dev/null
@@ -519,6 +553,7 @@ while :; do
 				log "watchdog: модем на $GW не отвечает на веб-API ($MF/$MODEM_MAX_FAILS)"
 				if [ "$MF" -ge "$MODEM_MAX_FAILS" ]; then
 					HARD=1
+					HARD_HANG=1
 					REASON="модем не отвечает на своём веб-API $MODEM_MAX_FAILS раза подряд"
 				fi
 			fi
@@ -547,6 +582,25 @@ while :; do
 	fi
 	{ echo "$RECENT"; echo "$NOW"; } | grep '[0-9]' >"$RESTARTS.new" 2>/dev/null
 	mv "$RESTARTS.new" "$RESTARTS" 2>/dev/null
+
+	# Эскалация ТОЛЬКО для зависшего модема (веб-API молчит, а интерфейс с адресом
+	# жив): мягкий `ip link down/up`+DHCP такое часто не лечит. Сначала MODEM_SOFT_TRIES
+	# мягких попыток (их делает сам bring_up --reconnect), дальше — жёсткий USB-ресет
+	# (де-/ре-авторизация устройства = перевтыкание), после которого обычный подъём
+	# переинициализирует вернувшийся в storage-режим модем. Счётчик обнуляется, как
+	# только модем снова ответил (см. ветку успеха выше). Для «нет адреса»/«pppd умер»
+	# (HARD_HANG=0) — как раньше, просто подъём.
+	if [ "$HARD_HANG" = 1 ]; then
+		RCV=$(read_num "$MODEM_RECOVERIES")
+		echo $((RCV + 1)) >"$MODEM_RECOVERIES" 2>/dev/null
+		if [ "$RCV" -ge "$MODEM_SOFT_TRIES" ]; then
+			log "watchdog: мягкий реконнект модем не оживил ($REASON) — жёсткий USB-ресет (восстановление $((RCV + 1)))"
+			sh "$DIR/wwan-up.sh" --usb-reset >>"$LOG" 2>&1 ||
+				log "watchdog: USB-ресет вернул ошибку — всё равно пробую поднять"
+		else
+			log "watchdog: модем завис ($REASON) — сначала мягкий реконнект (попытка $((RCV + 1))/$MODEM_SOFT_TRIES до USB-ресета)"
+		fi
+	fi
 
 	log "watchdog: модемная сеть пропала ($REASON) — поднимаю заново"
 	bring_up --reconnect
