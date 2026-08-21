@@ -170,6 +170,13 @@ iface_addr() { ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ 
 MODEM_FAILS=$STATE/modem-fails
 MODEM_STATUS=$STATE/modem-status
 MODEM_RECOVERIES=$STATE/modem-recoveries   # подряд восстановлений зависшего модема (сброс при ответе)
+# "<iface> <шлюз>" модема, чьё веб-API нам хоть раз ответило. Пока такой отметки
+# нет, молчание веб-API НЕ считается зависанием: веб-морды у модема может не быть
+# вовсе (простой CDC-ECM/RNDIS), а шлюз теперь определяется всегда, вплоть до .1
+# своей подсети — без отметки такой модем перезапускался бы вечно при живом
+# интернете. Отметка переживает перезагрузку (тот же модем — тот же вердикт) и не
+# подойдёт другому модему: у него будет либо свой интерфейс, либо свой шлюз.
+MODEM_API_SEEN=$STATE/modem-api-seen
 MODEM_MAX_FAILS=${WWAN_MODEM_MAX_FAILS:-3}
 # Сколько МЯГКИХ реконнектов (`ip link down/up` + DHCP) пробуем, прежде чем перейти
 # на ЖЁСТКИЙ USB-ресет (authorized 0/1). 1 = один мягкий, дальше жёсткие, пока не
@@ -272,7 +279,7 @@ case "$1" in
 	echo "wan_addr=$([ -n "$_if" ] && iface_addr "$_if")"
 	exit 0 ;;
 --reset)
-	rm -f "$DISABLED" "$INFLIGHT" "$RESTARTS" "$MODEM_FAILS" "$MODEM_RECOVERIES"
+	rm -f "$DISABLED" "$INFLIGHT" "$RESTARTS" "$MODEM_FAILS" "$MODEM_RECOVERIES" \n		"$MODEM_API_SEEN"
 	echo 0 >"$ATTEMPTS"
 	sync
 	log "защита сброшена вручную, автозапуск снова разрешён"
@@ -467,6 +474,8 @@ cooldown_sleep() {
 # pidfile уже занят выше, перед задержкой — здесь заново его писать не нужно.
 log "watchdog: проверка каждые $WATCH_INTERVAL с (не больше $MAX_RESTARTS_PER_HOUR перезапусков в час)"
 
+MODEM_API_NOTED=0   # строку «веб-API не ответило ни разу» пишем раз за запуск
+
 while :; do
 	watch_sleep
 
@@ -532,11 +541,15 @@ while :; do
 	#
 	# Второй признак — модем перестал отвечать на СВОЙ веб-API (см. modem_probe):
 	# значит завис он сам, а не сеть у оператора. У PPP-модемов веб-морды нет,
-	# поэтому там проверка пропускается.
+	# поэтому там проверка пропускается; у остальных она включается только после
+	# первого удачного ответа (см. MODEM_API_SEEN) — модем без веб-морды иначе
+	# выглядел бы вечно зависшим.
 	if [ "$HARD" = 0 ] && [ "$IF" != ppp0 ]; then
 		GW=$(modem_gw "$IF")
 		if [ -n "$GW" ]; then
 			if CONN=$(modem_probe "$GW"); then
+				[ "$(cat "$MODEM_API_SEEN" 2>/dev/null)" = "$IF $GW" ] ||
+					echo "$IF $GW" >"$MODEM_API_SEEN" 2>/dev/null
 				[ "$(cat "$MODEM_FAILS" 2>/dev/null)" = 0 ] || echo 0 >"$MODEM_FAILS" 2>/dev/null
 				# Модем снова отвечает — эскалацию начинаем с нуля (следующее зависание
 				# опять сперва лечим мягко).
@@ -546,7 +559,7 @@ while :; do
 					echo "$CONN" >"$MODEM_STATUS" 2>/dev/null
 					log "watchdog: модем на $GW отвечает, соединение — $(conn_word "$CONN")"
 				fi
-			else
+			elif [ "$(cat "$MODEM_API_SEEN" 2>/dev/null)" = "$IF $GW" ]; then
 				MF=$(( $(read_num "$MODEM_FAILS") + 1 ))
 				[ "$MF" -gt "$MODEM_MAX_FAILS" ] && MF=$MODEM_MAX_FAILS
 				[ "$(cat "$MODEM_FAILS" 2>/dev/null)" = "$MF" ] || echo "$MF" >"$MODEM_FAILS" 2>/dev/null
@@ -556,6 +569,11 @@ while :; do
 					HARD_HANG=1
 					REASON="модем не отвечает на своём веб-API $MODEM_MAX_FAILS раза подряд"
 				fi
+			elif [ "$MODEM_API_NOTED" = 0 ]; then
+				# Ни разу не ответило — значит веб-морды у модема, скорее всего, нет.
+				# Говорим об этом один раз за запуск и молчим дальше: такт частый.
+				MODEM_API_NOTED=1
+				log "watchdog: веб-API на $GW не ответило ни разу — проверку модема выключаю (у модема её нет?)"
 			fi
 		fi
 	fi
@@ -595,8 +613,8 @@ while :; do
 		echo $((RCV + 1)) >"$MODEM_RECOVERIES" 2>/dev/null
 		if [ "$RCV" -ge "$MODEM_SOFT_TRIES" ]; then
 			log "watchdog: мягкий реконнект модем не оживил ($REASON) — жёсткий USB-ресет (восстановление $((RCV + 1)))"
-			sh "$DIR/wwan-up.sh" --usb-reset >>"$LOG" 2>&1 ||
-				log "watchdog: USB-ресет вернул ошибку — всё равно пробую поднять"
+			sh "$DIR/wwan-up.sh" --usb-reset >/dev/null 2>&1 ||
+				log "watchdog: USB-ресет не удался (устройство не вернулось, подробности в wwan.log) — всё равно пробую поднять"
 		else
 			log "watchdog: модем завис ($REASON) — сначала мягкий реконнект (попытка $((RCV + 1))/$MODEM_SOFT_TRIES до USB-ресета)"
 		fi

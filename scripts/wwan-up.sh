@@ -500,7 +500,7 @@ usb_reset() {
 		_ur_i=$((_ur_i + 1))
 	done
 	warn "после USB-ресета устройство не появилось за 20 с — подъём попробует сам"
-	return 0
+	return 1
 }
 
 # ttyUSB, соответствующий интерфейсу с заданным bInterfaceProtocol

@@ -365,9 +365,11 @@ public final class TboxWire {
                         if (took >= SLOW_POLL_WARN_MS) say("опрос модема занял " + took + " мс");
                     }
                     try {
-                        // hilink опрашиваем чаще (дешёвый HTTP) — иконка ближе к webUI; ppp реже
-                        // (AT-сессия дорогая). hilinkFlavor != null == точно hilink.
-                        Thread.sleep(hilinkFlavor != null ? MODEM_POLL_MS_HILINK : MODEM_POLL_MS);
+                        // hilink с живой веб-мордой опрашиваем чаще (дешёвый HTTP) — иконка ближе
+                        // к webUI; ppp и модемы без веб-API — реже (AT-сессия дорогая, а стучаться
+                        // в несуществующий HTTP тем более незачем). Признак — hilinkApiSeen, а не
+                        // hilinkFlavor: тот обнуляется на каждом промахе, см. его объявление.
+                        Thread.sleep(hilinkApiSeen ? MODEM_POLL_MS_HILINK : MODEM_POLL_MS);
                     } catch (InterruptedException e) { return; }
                 }
             }
@@ -568,13 +570,22 @@ public final class TboxWire {
     // Какой из двух — не гадаем по вендору, а просто пробуем оба и запоминаем удачный.
 
     static String hilinkFlavor = null;   // "huawei" | "zte" | "none"
+    // «Модем — hilink, и его веб-API нам уже отвечало»: ставится при первом удачном опросе и
+    // больше не снимается. hilinkFlavor для этого не годится — он обнуляется на КАЖДОМ промахе
+    // (чтобы на следующем круге снова пробовать оба API), и такт опроса тут же падал бы до
+    // ppp-шных 15 с. Тогда HILINK_GRACE=2 означал бы не ~6 с, а полминуты — и столько же
+    // занимало бы обратное «модем ожил». А у модема без веб-морды такт так и останется
+    // редким: долбить несуществующий HTTP раз в 3 с незачем.
+    static boolean hilinkApiSeen = false;
 
     // Сколько подряд неудачных опросов веб-морды терпим, прежде чем честно сказать «нет сети».
     // Линк (адрес на eth1) может пережить пропажу радио/самого модема — DHCP-адрес остаётся, а
     // веб-API уже мёртв; без этого счётчика pollHilink вечно репортил REG_STATUS_REGISTERED (4G,
     // середина палок) и иконка застревала на «успехе» при выдернутом/зависшем модеме. Первые
     // GRACE опросов держим «неизвестно» (не мигаем на разовой заминке), дальше — крестик.
-    static final int HILINK_GRACE = 2;   // ~2 такта опроса hilink (MODEM_POLL_MS_HILINK) ≈ 6 c
+    // ~2 такта опроса hilink (MODEM_POLL_MS_HILINK) ≈ 6 c: такт остаётся 3-секундным и на
+    // промахах, потому что смотрим на hilinkApiSeen, а не на обнуляемый hilinkFlavor.
+    static final int HILINK_GRACE = 2;
     static int hilinkMisses = 0;
 
     static Sig pollHilink(String iface) {
@@ -584,11 +595,11 @@ public final class TboxWire {
         }
         if (!"zte".equals(hilinkFlavor)) {
             Sig s = pollHuawei(gw, iface);
-            if (s != null) { hilinkFlavor = "huawei"; hilinkMisses = 0; return s; }
+            if (s != null) { hilinkFlavor = "huawei"; hilinkApiSeen = true; hilinkMisses = 0; return s; }
         }
         if (!"huawei".equals(hilinkFlavor)) {
             Sig s = pollZte(gw, iface);
-            if (s != null) { hilinkFlavor = "zte"; hilinkMisses = 0; return s; }
+            if (s != null) { hilinkFlavor = "zte"; hilinkApiSeen = true; hilinkMisses = 0; return s; }
         }
         hilinkFlavor = null;   // на следующем круге пробуем оба заново
         return hilinkMiss("линк " + iface + ", веб-API модема на " + gw + " не ответило");
