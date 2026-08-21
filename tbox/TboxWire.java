@@ -73,8 +73,12 @@ public final class TboxWire {
     // ttyUSB0 в конце: на старых свистках (E173) AT отвечает и он, но это же порт для
     // pppd, и занимать его без нужды не стоит — пробуем только когда молчат остальные.
     static final String[] FALLBACK_AT_TTYS = { "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB0" };
-    static final int MODEM_POLL_MS = 15000;       // одна AT-сессия занимает ~3 с, чаще незачем
-    static final int STRENGTH_WHEN_UNKNOWN = 3;   // линк есть, а цифр нет — рисуем середину
+    static final int MODEM_POLL_MS = 15000;       // ppp: одна AT-сессия занимает ~3 с, чаще незачем
+    // hilink: опрос — это дешёвый HTTP-GET (без AT-порта и контеншена с wwan-up.sh), поэтому
+    // спрашиваем часто. При 15 с иконка отставала от webUI до 15 с — на ходу это и выглядело как
+    // «уровень не совпадает». 3 с держат её вплотную к живому значению модема почти без цены.
+    static final int MODEM_POLL_MS_HILINK = 3000;
+    static final int STRENGTH_WHEN_UNKNOWN = 3;   // нет НИ ОДНОГО измерения — только тогда «середина»
     static final int HTTP_TIMEOUT_MS = 3000;
     // Регистр важен: модем отвечает строчными буквами ("+csq: 18,99") — stty на этом
     // драйвере не применяется, а значит и -iuclc не работает. Поэтому CASE_INSENSITIVE.
@@ -107,6 +111,7 @@ public final class TboxWire {
         return phase == PHASE_APPCHECK ? APPCHECK_NOTIFY_MS : CONNECTING_NOTIFY_MS;
     }
     static int fixedStrength = Integer.MIN_VALUE;  // MIN_VALUE == брать реальный сигнал модема
+    static int lastMeasuredStrength = -1;          // последний РЕАЛЬНО измеренный уровень (для unknownStrength)
     static boolean signalOnly = false; // разовый опрос модема и выход, без SOME/IP
     static String gwOverride = null;   // адрес веб-API hilink-модема, если не угадывается
     static int regOverride = -1;       // сырой celluarRegisterStatus — посмотреть, что нарисуется
@@ -353,11 +358,16 @@ public final class TboxWire {
                             s = new Sig(regOverride, s.strength, s.detail + " [--reg]");
                         }
                         cachedSignal = s;
+                        // Запоминаем ПОСЛЕДНИЙ реально измеренный уровень: если следующий опрос
+                        // не сможет прочитать цифру, покажем его, а не фейковую «середину».
+                        if (s.measured && s.strength >= 0 && s.strength <= 5) lastMeasuredStrength = s.strength;
                         long took = (System.nanoTime() - t0) / 1000000L;
                         if (took >= SLOW_POLL_WARN_MS) say("опрос модема занял " + took + " мс");
                     }
                     try {
-                        Thread.sleep(MODEM_POLL_MS);
+                        // hilink опрашиваем чаще (дешёвый HTTP) — иконка ближе к webUI; ppp реже
+                        // (AT-сессия дорогая). hilinkFlavor != null == точно hilink.
+                        Thread.sleep(hilinkFlavor != null ? MODEM_POLL_MS_HILINK : MODEM_POLL_MS);
                     } catch (InterruptedException e) { return; }
                 }
             }
@@ -421,7 +431,7 @@ public final class TboxWire {
         String gen = copsGeneration(rat);
         String who = (oper.isEmpty() ? "" : oper + " ") + (gen == null ? "тип сети неизвестен" : gen);
         if (csq < 0 || csq == 99) {
-            return new Sig(genToReg(gen), STRENGTH_WHEN_UNKNOWN,
+            return new Sig(genToReg(gen), unknownStrength(),
                     stage + ", CSQ неизвестен (" + csq + "), " + who);
         }
         return new Sig(genToReg(gen), csqToStrength(csq),
@@ -564,7 +574,7 @@ public final class TboxWire {
     // веб-API уже мёртв; без этого счётчика pollHilink вечно репортил REG_STATUS_REGISTERED (4G,
     // середина палок) и иконка застревала на «успехе» при выдернутом/зависшем модеме. Первые
     // GRACE опросов держим «неизвестно» (не мигаем на разовой заминке), дальше — крестик.
-    static final int HILINK_GRACE = 2;   // ~2 такта опроса (MODEM_POLL_MS) ≈ 10 c
+    static final int HILINK_GRACE = 2;   // ~2 такта опроса hilink (MODEM_POLL_MS_HILINK) ≈ 6 c
     static int hilinkMisses = 0;
 
     static Sig pollHilink(String iface) {
@@ -592,7 +602,7 @@ public final class TboxWire {
     static Sig hilinkMiss(String why) {
         hilinkMisses++;
         if (hilinkMisses <= HILINK_GRACE) {
-            return new Sig(REG_STATUS_REGISTERED, STRENGTH_WHEN_UNKNOWN,
+            return new Sig(REG_STATUS_REGISTERED, unknownStrength(),
                     why + " (попытка " + hilinkMisses + "/" + HILINK_GRACE + ")");
         }
         return new Sig(REG_NONE, -1, why + " (" + hilinkMisses + " опросов подряд → нет сети)");
@@ -627,7 +637,7 @@ public final class TboxWire {
         int netType = intOr(xmlTag(body, "CurrentNetworkType"), -1);
         String gen = huaweiGeneration(netType);
         String rat = gen == null ? ("тип сети неизвестен (CurrentNetworkType " + netType + ")") : gen;
-        if (bars < 0) return new Sig(genToReg(gen), STRENGTH_WHEN_UNKNOWN,
+        if (bars < 0) return new Sig(genToReg(gen), unknownStrength(),
                 "линк " + iface + ", Huawei API без SignalIcon, " + rat);
         return new Sig(bars > 0 ? genToReg(gen) : REG_NONE, clampBars(bars),
                 "линк " + iface + ", Huawei API " + gw + path + ": " + bars + "/5, " + rat, true);
@@ -644,7 +654,7 @@ public final class TboxWire {
         String rssi = jsonVal(body, "rssi");
         String gen = zteGeneration(netType);
         String rat = netType == null ? "тип сети неизвестен" : netType;
-        if (bars < 0) return new Sig(genToReg(gen), STRENGTH_WHEN_UNKNOWN,
+        if (bars < 0) return new Sig(genToReg(gen), unknownStrength(),
                 "линк " + iface + ", ZTE API без signalbar, " + rat);
         return new Sig(bars > 0 ? genToReg(gen) : REG_NONE, clampBars(bars),
                 "линк " + iface + ", ZTE API " + gw + ": " + bars + "/5, " + rat
@@ -678,6 +688,15 @@ public final class TboxWire {
     }
 
     static int clampBars(int b) { return b < 0 ? 0 : b > 5 ? 5 : b; }
+
+    // Уровень, когда прочитать реальный сейчас нельзя (линк есть, а цифры нет): держим ПОСЛЕДНИЙ
+    // измеренный, а не фиксированную «середину» — при разовом сбое чтения иконка не прыгает на
+    // 3 палки мимо реального уровня (это и рассинхронивало её с webUI). Ни одного измерения за
+    // сессию ещё не было — только тогда STRENGTH_WHEN_UNKNOWN.
+    static int unknownStrength() {
+        return (lastMeasuredStrength >= 0 && lastMeasuredStrength <= 5)
+                ? lastMeasuredStrength : STRENGTH_WHEN_UNKNOWN;
+    }
 
     /**
      * Шлюз модема: сначала default-маршрут через этот интерфейс в любой таблице
